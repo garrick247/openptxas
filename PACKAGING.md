@@ -124,7 +124,7 @@ These are **not bugs**, they are scoped-out work items:
 Developer fresh-clone workflow:
 
 ```bash
-git clone https://github.com/garrick99/openptxas
+git clone https://github.com/garrick247/openptxas
 cd openptxas
 python -m pytest tests/ -q              # non-GPU, ~75s, must be 865 passed
 python scripts/health.py --frontier-only # ~6s, must show 0 MIXED, 0 errors

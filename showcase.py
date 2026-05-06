@@ -289,7 +289,7 @@ def finale():
     print(f"{BOLD}{CYAN}" + "=" * 72 + f"{RESET}")
     print(f"  {BOLD}SM_120 FULLY UNLOCKED - every subsystem reverse-engineered{RESET}")
     print(f"  Open-source toolchain at {GREEN}{BOLD}99.3% parity{RESET} with NVIDIA's closed stack")
-    print(f"  Repo: {CYAN}github.com/garrick99/openptxas{RESET}")
+    print(f"  Repo: {CYAN}github.com/garrick247/openptxas{RESET}")
     print(f"  Reference: {CYAN}docs/SM_120_REFERENCE.md{RESET} (2532 lines)")
     print(f"{BOLD}{CYAN}" + "=" * 72 + f"{RESET}")
     print()
