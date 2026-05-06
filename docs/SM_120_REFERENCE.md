@@ -1222,7 +1222,7 @@ BAR.SYNC  0
 
 ### 10.1 OpenPTXas (primary source)
 
-- **Repo:** `garrick99/openptxas` (public on GitHub)
+- **Repo:** `garrick247/openptxas` (public on GitHub)
 - **Local:** `C:/Users/kraken/openptxas`
 - **Encoders:** `sass/encoding/sm_120_opcodes.py` (183 encoder functions)
 - **Scoreboard:** `sass/scoreboard.py` (93 opcode classifications, 17+ rules)
@@ -1258,7 +1258,7 @@ BAR.SYNC  0
 If you find new opcode semantics, encoding quirks, or scoreboard rules:
 1. Reproduce on RTX 5090 hardware (or SM_120 equivalent)
 2. Provide a minimal reproducer cubin
-3. File an issue or PR on `garrick99/openptxas`
+3. File an issue or PR on `garrick247/openptxas`
 
 ---
 
@@ -2526,7 +2526,7 @@ static-analysis validations.
 
 ---
 
-*Reference maintained at github.com/garrick99/openptxas. Corrections and
+*Reference maintained at github.com/garrick247/openptxas. Corrections and
 additions welcome.*
 
 

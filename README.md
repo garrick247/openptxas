@@ -17,11 +17,11 @@ OpenPTXas is the back of a fully open-source GPU toolchain:
                                                 ↑ this repo    PTX → SASS → ELF
 ```
 
-- **[Forge](https://github.com/garrick99/forge)** — formally-verified systems language (optional front-end)
-- **[OpenCUDA](https://github.com/garrick99/opencuda)** — CUDA C → PTX, pure Python
+- **[Forge](https://github.com/garrick247/forge)** — formally-verified systems language (optional front-end)
+- **[OpenCUDA](https://github.com/garrick247/opencuda)** — CUDA C → PTX, pure Python
 - **OpenPTXas** (this repo) — PTX → SM_120 cubin, pure Python
-- **[forge-workbench](https://github.com/garrick99/forge-workbench)** — cross-stack CLI cockpit (run / compare / benchmark / classify across all four projects above)
-- **[VortexSTARK](https://github.com/garrick99/VortexSTARK)** — production user via the Forge front-end (9 forge-emitted kernels in the prover)
+- **[forge-workbench](https://github.com/garrick247/forge-workbench)** — cross-stack CLI cockpit (run / compare / benchmark / classify across all four projects above)
+- **[VortexSTARK](https://github.com/garrick247/VortexSTARK)** — production user via the Forge front-end (9 forge-emitted kernels in the prover)
 
 No NVIDIA compiler is invoked at any stage of the toolchain.
 
@@ -34,7 +34,7 @@ GPU-verified on RTX 5090 (Blackwell SM_120), zero ptxas fallback anywhere in the
 | Pytest (parser, isel, scoreboard, encoders, codegen, regressions) | **904 / 904 pass** |
 | 144-kernel frontier (byte-classified vs ptxas 13.0) | **63 BYTE_EXACT / 78 STRUCTURAL / 3 MIXED** |
 | 7-kernel benchmark suite (all correctness-verified) | **geomean 1.06× vs ptxas**, SAXPY **1.72×** |
-| Pair with [OpenCUDA](https://github.com/garrick99/opencuda) (CUDA C → PTX) GPU E2E | **88 / 88 pass** |
+| Pair with [OpenCUDA](https://github.com/garrick247/opencuda) (CUDA C → PTX) GPU E2E | **88 / 88 pass** |
 | SASS encoder coverage | **183 encoders / 108 unique SM_120 opcodes** |
 
 The 904 pytest count breaks down as: 787 non-GPU (parser / regalloc / isel / encoder / scheduler / scoreboard regressions, run as one batch), 89 GPU (`test_gpu_*.py` files run one-at-a-time to avoid CUDA UR cache pollution), and 28 misc (`test_capmerc_gen.py`, `test_bugfix_benchmark.py`, `test_fg40_harness.py`).
@@ -126,7 +126,7 @@ Additional ptxas bugs surfaced by the stack (dossiered, pre-disclosure):
 ## Quick Start
 
 ```bash
-git clone https://github.com/garrick99/openptxas
+git clone https://github.com/garrick247/openptxas
 cd openptxas
 python demo.py                                   # compile + run vector_add on GPU
 python benchmarks/run_all.py                     # benchmark vs ptxas
@@ -151,7 +151,7 @@ Pure Python 3.11+. No external dependencies beyond NVIDIA driver (for execution)
 | Emitter | `sass/pipeline.py` | Full ELF cubin with `.nv.info`, `.nv.capmerc`, `.nv.merc` |
 | Fuzzer | `fuzzer/` | Grammar-based differential fuzz with well-formedness filter |
 
-The CLI dashboard (run / status / show / kdiff / explore / history / diff / stress) used to live here as `workbench.py`; it now ships as a stand-alone package — see [forge-workbench](https://github.com/garrick99/forge-workbench).
+The CLI dashboard (run / status / show / kdiff / explore / history / diff / stress) used to live here as `workbench.py`; it now ships as a stand-alone package — see [forge-workbench](https://github.com/garrick247/forge-workbench).
 
 ## SM_120 Blackwell Discoveries
 
