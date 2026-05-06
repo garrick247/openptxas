@@ -95,7 +95,13 @@ try:
 except Exception as e:
     print(f'compile_err={{e!r}}'); sys.exit(0)
 
-cuda = ctypes.WinDLL('nvcuda'); cuda.cuInit(0)
+for _libname in ('libcuda.so.1', 'libcuda.so', 'nvcuda'):
+    try:
+        cuda = ctypes.CDLL(_libname); break
+    except OSError: continue
+else:
+    print('proc_err=libcuda not found'); sys.exit(0)
+cuda.cuInit(0)
 dev = ctypes.c_int(); cuda.cuDeviceGet(ctypes.byref(dev), 0)
 ctx = ctypes.c_void_p(); cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, dev)
 try:
