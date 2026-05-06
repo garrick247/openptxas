@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -12,60 +11,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # -------------------------------------------------------------------------
-  # Tier 1 — compile-only gate.  Runs on every PR on GitHub-hosted Ubuntu
-  # runners.  No GPU; no CUDA driver needed.  Asserts every fixture
-  # compiles through compile_function without raising.
-  # -------------------------------------------------------------------------
-  compile-gate:
-    name: compile-gate (142 fixtures, CPU-only)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  corpus:
+    name: corpus (compile + GPU sweep, RTX 5090 / SM_120)
+    runs-on: [self-hosted, gpu, cuda]
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: set up python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: install deps
+      - name: Build venv + install
         run: |
-          python -m pip install --upgrade pip
-          pip install -e .
-          # forge-workbench provides the `workbench` package (KERNELS catalog
-          # + compile helpers). It used to live as openptxas/workbench.py;
-          # spun out into garrick99/forge-workbench. Several openptxas scripts
-          # (corpus_compile_check.py, corpus_sweep.py, etc.) still
-          # `import workbench` against the now-external package.
-          pip install git+https://github.com/garrick99/forge-workbench.git
+          python3 -m venv .venv
+          .venv/bin/pip install -q --upgrade pip
+          # Sibling local deps not on PyPI; runner is the linux box
+          # where all garrick247 repos are cloned at /home/garrick/<repo>.
+          # Install openptxas first (forge-workbench depends on it).
+          .venv/bin/pip install -q -e .
+          .venv/bin/pip install -q -e /home/garrick/forge-workbench
       - name: corpus compile check
-        run: python scripts/corpus_compile_check.py
-
-  # -------------------------------------------------------------------------
-  # Tier 2 — full GPU execution gate.  Runs on the self-hosted
-  # [self-hosted, gpu, sm_120] runner (RTX 5090, BigDaddy).  Runs on
-  # every push to main, on PRs labeled `gpu-check`, and on manual
-  # workflow_dispatch.  Does NOT block PRs from forks (self-hosted
-  # runners on public repos gate fork-PR workflows automatically).
-  # -------------------------------------------------------------------------
-  corpus-gpu:
-    name: corpus-gpu (full execution, RTX 5090 / SM_120)
-    runs-on: [self-hosted, gpu, sm_120]
-    needs: compile-gate
-    if: >-
-      ${{ github.event_name == 'push'
-          || github.event_name == 'workflow_dispatch'
-          || (github.event_name == 'pull_request'
-              && contains(github.event.pull_request.labels.*.name, 'gpu-check')) }}
-    timeout-minutes: 15
-    # Uses the runner host's system Python directly (not setup-python).
-    # setup-python downloads a fresh Python and runs its setup.ps1, which
-    # gets blocked by the PowerShell execution policy on the NETWORK
-    # SERVICE context.  The runner host already has openptxas installed
-    # in the user's Python at a known path.
-    env:
-      PYTHON: 'C:\Users\kraken\AppData\Local\Python\bin\python.exe'
-    steps:
-      - uses: actions/checkout@v4
+        run: .venv/bin/python scripts/corpus_compile_check.py
       - name: corpus execution sweep
-        run: '& "$env:PYTHON" scripts/corpus_sweep.py'
-        shell: pwsh
+        run: .venv/bin/python scripts/corpus_sweep.py

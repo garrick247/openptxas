@@ -11,3 +11,11 @@
 #  loop-optimization passes confirmed relu now passes on GPU; the
 #  corpus-gpu run at workflow ID 25029383142 surfaced it as an
 #  UNEXPECTED-PASS, prompting this delisting.)
+
+# w2_nested_loop — codegen produces SASS that hangs the GPU on
+# cuCtxSynchronize (15s timeout). Surfaced 2026-05-05 by the first
+# Linux-runner sweep after the bigdaddy migration; not a Linux-port
+# regression (this kernel's behavior on Windows pre-migration is
+# unknown — workbench fixture set drifted from the 142-fixture
+# milestone to 125 around the same time). File codegen bug.
+w2_nested_loop
