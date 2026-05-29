@@ -1962,6 +1962,34 @@ def compile_function(fn: Function, verbose: bool = False,
     body_reordered = list(reordered[n_preamble:])
     body_scheduled = assign_ctrl(list(reordered[n_preamble:]))
 
+    # GPR-latency hazard workaround (gather_u256-class kernels): the per-element
+    # full-64-bit-address recompute reuses address GPRs so tightly that a
+    # producer->consumer GPR read races ahead in free-run (offset-high reg read
+    # stale -> wild pointer -> MISALIGNED/ILLEGAL). compute-sanitizer and
+    # single-step both hide it; targeted RAW/WAR gaps do not fix it but a
+    # uniform 1-instruction gap after every body instruction does (proven:
+    # plain 5/5 + compute-sanitizer 0 errors). Apply ONLY to straight-line
+    # kernels (no real branches; a single trailing self-BRA trap is fine) so
+    # branchy kernels (loops) keep byte-exact branch offsets and are unaffected.
+    def _is_straight_line(_instrs):
+        _bra = 0
+        for _j, _si in enumerate(_instrs):
+            if (_si.raw[0] | (_si.raw[1] << 8)) & 0xFFF == 0x947:  # BRA
+                # allow only a single BRA as (or near) the last instruction (trap)
+                if _j < len(_instrs) - 2:
+                    return False
+                _bra += 1
+        return _bra <= 1
+    if _is_straight_line(body_scheduled):
+        from sass.encoding.sm_120_opcodes import encode_nop as _gap_nop
+        from sass.scoreboard import _get_opcode as _gap_opc
+        _padded = []
+        for _si in body_scheduled:
+            _padded.append(_si)
+            if _gap_opc(_si.raw) not in (0x94d, 0x947):  # not after EXIT / BRA
+                _padded.append(SassInstr(_gap_nop(), 'NOP  // GPR-latency gap (straight-line addr-recompute hazard)'))
+        body_scheduled = _padded
+
     # SM_120 rule #25: add LDCU.32 prelude for vote-kernel s32 params.
     # Body LDC (0xb82) is forbidden in vote kernels. Use LDCU.32 in the
     # prelude region instead. The value stays in UR and is consumed by
