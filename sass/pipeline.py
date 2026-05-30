@@ -1125,6 +1125,23 @@ def compile_function(fn: Function, verbose: bool = False,
             SassInstr(bytes.fromhex('827b01ff00df00000008000000e20f00'),
                       'LDC R1, c[0][0x37c]  // frame ptr'),
         ]
+        # If the kernel uses .local memory, allocate the stack frame by
+        # decrementing R1 (the per-thread local pointer) by frame_size.
+        # Matches ptxas's pattern: LDC R1 c[0][0x37c] ; IADD R1, R1, -fs.
+        # The cubin's EIATTR_FRAME_SIZE/MIN_STACK_SIZE tells the driver
+        # how much per-thread local memory to reserve.
+        _pre_fs = 0
+        if hasattr(fn, 'local_decls') and fn.local_decls:
+            _o = 0
+            for _ld in fn.local_decls:
+                _o = (_o + _ld.align - 1) & ~(_ld.align - 1)
+                _o += _ld.size
+            _pre_fs = _o
+        if _pre_fs > 0:
+            from sass.encoding.sm_120_opcodes import encode_iadd3_imm32 as _frame_iadd
+            preamble.append(SassInstr(
+                _frame_iadd(1, 1, (-_pre_fs) & 0xFFFFFFFF, 255),
+                f'IADD3 R1, R1, -0x{_pre_fs:x}, RZ  // allocate .local frame'))
         ur4_desc_instr = SassInstr(
             encode_ldcu_64(4, 0, 0x358, ctrl=0x717),
             'LDCU.64 UR4, c[0][0x358]  // mem desc')
@@ -1289,6 +1306,21 @@ def compile_function(fn: Function, verbose: bool = False,
             offset = (offset + sd.align - 1) & ~(sd.align - 1)
             ctx._smem_offsets[sd.name] = offset
             offset += sd.size
+
+    # Compute local (per-thread stack) variable offsets for isel + total
+    # frame size for the cubin EIATTR_FRAME_SIZE / EIATTR_MIN_STACK_SIZE.
+    # Without this, `mov.u64 %rd, _local_NN` was being dropped and the
+    # cubin reported frame_size=0 -> driver allocated no local memory ->
+    # STL with uninitialized GPR -> invalid local writes (sanitizer 700).
+    ctx._local_offsets = {}
+    ctx._frame_size = 0
+    if hasattr(fn, 'local_decls') and fn.local_decls:
+        offset = 0
+        for ld in fn.local_decls:
+            offset = (offset + ld.align - 1) & ~(ld.align - 1)
+            ctx._local_offsets[ld.name] = offset
+            offset += ld.size
+        ctx._frame_size = offset
 
     # SM_120 rule #25: detect kernels needing ptxas fallback.
     # Complex kernels with LDG produce instruction streams that differ from
@@ -3771,6 +3803,15 @@ def compile_function(fn: Function, verbose: bool = False,
             offset += sd.size
         smem_size = offset
 
+    # Compute per-thread frame size from .local declarations
+    frame_size = 0
+    if hasattr(fn, 'local_decls') and fn.local_decls:
+        offset = 0
+        for ld in fn.local_decls:
+            offset = (offset + ld.align - 1) & ~(ld.align - 1)
+            offset += ld.size
+        frame_size = offset
+
     desc = KernelDesc(
         name=fn.name,
         sass_bytes=sass_bytes,
@@ -3783,6 +3824,7 @@ def compile_function(fn: Function, verbose: bool = False,
         exit_offset=exit_offset,
         s2r_offset=s2r_offset,
         smem_size=smem_size,
+        frame_size=frame_size,
         num_uniform=alloc.num_uniform,
         # Use ptxas capmerc when available — it has correct instruction class
         # records that our simpler generator may miss. Patch GPR count to match

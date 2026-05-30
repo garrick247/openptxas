@@ -20,7 +20,7 @@ except ImportError:
 from .ir import (
     Module, Function, BasicBlock, Instruction, RegDecl, ParamDecl,
     TypeSpec, RegOp, ImmOp, LabelOp, MemOp, ConstBankOp, FpImmOp,
-    Operand, ScalarKind, SharedDecl,
+    Operand, ScalarKind, SharedDecl, LocalDecl,
 )
 
 # ---------------------------------------------------------------------------
@@ -367,10 +367,11 @@ class _Parser:
             return Function(name=name, is_kernel=is_kernel, params=params)
 
         if self._peek() and self._peek().value == "{":
-            reg_decls, blocks, shared_decls = self._parse_func_body()
+            reg_decls, blocks, shared_decls, local_decls = self._parse_func_body()
             return Function(name=name, is_kernel=is_kernel, params=params,
                             reg_decls=reg_decls, blocks=blocks,
-                            shared_decls=shared_decls)
+                            shared_decls=shared_decls,
+                            local_decls=local_decls)
 
         return Function(name=name, is_kernel=is_kernel, params=params)
 
@@ -438,6 +439,7 @@ class _Parser:
         self._expect("PUNCT", "{")
         reg_decls: list[RegDecl]   = []
         shared_decls: list         = []
+        local_decls:  list         = []
         blocks:    list[BasicBlock] = []
         current_block = BasicBlock(label=None)
         blocks.append(current_block)
@@ -464,7 +466,14 @@ class _Parser:
                     shared_decls.append(sdecl)
                 continue
 
-            # .local / other body-level directives
+            # .local declaration: .local .align N .bNN name[COUNT]
+            if tok.kind == "IDENT" and tok.value == ".local":
+                ldecl = self._parse_local_decl()
+                if ldecl:
+                    local_decls.append(ldecl)
+                continue
+
+            # other body-level directives — silently consume
             if tok.kind == "IDENT" and tok.value.startswith("."):
                 self._consume_to_semicolon()
                 continue
@@ -485,7 +494,37 @@ class _Parser:
 
         # Drop empty leading block with no label
         blocks = [b for b in blocks if b.label or b.instructions]
-        return reg_decls, blocks, shared_decls
+        return reg_decls, blocks, shared_decls, local_decls
+
+    def _parse_local_decl(self) -> Optional[LocalDecl]:
+        """Parse .local .align N .bNN name[COUNT]; declaration. Analog of
+        _parse_shared_decl — only the leading directive token differs."""
+        self._expect("IDENT", ".local")
+        align = 4
+        if self._peek() and self._peek().value == ".align":
+            self._advance()
+            align_tok = self._expect("INT")
+            align = int(align_tok.value)
+        type_spec = self._parse_type_spec()
+        if type_spec is None:
+            self._consume_to_semicolon()
+            return None
+        tok = self._peek()
+        if tok is None:
+            self._consume_to_semicolon()
+            return None
+        name = tok.value
+        self._advance()
+        count = 1
+        if self._match("PUNCT", "["):
+            count_tok = self._expect("INT")
+            count = int(count_tok.value)
+            self._expect("PUNCT", "]")
+        self._match("PUNCT", ";")
+        elem_size = type_spec.width // 8
+        total_size = elem_size * count
+        return LocalDecl(name=name, align=align,
+                         elem_type=str(type_spec), count=count, size=total_size)
 
     def _parse_shared_decl(self) -> Optional[SharedDecl]:
         """Parse .shared .align N .bNN name[COUNT]; declaration."""

@@ -116,7 +116,7 @@ def _patch_cuinfo_sm(sm_version: int) -> bytes:
     return bytes(buf)
 
 
-def _build_nv_info_global(num_gprs: int = 16, num_uniform: int = 14):
+def _build_nv_info_global(num_gprs: int = 16, num_uniform: int = 14, frame_size: int = 0):
     # EIATTR_REGCOUNT (0x2f): GPR count at offset 4, UR count at offset 8.
     # Both must be at least the actual usage to avoid ILLEGAL_INSTRUCTION.
     #
@@ -167,6 +167,12 @@ def _build_nv_info_global(num_gprs: int = 16, num_uniform: int = 14):
     # Non-deferred kernels keep default 16 (=0x10 in hex string).
     if num_uniform < 0:
         buf[12] = 14  # ptxas ground truth for 5-param kernels
+    # Patch EIATTR_FRAME_SIZE (offset 20..23) and EIATTR_MIN_STACK_SIZE
+    # (offset 32..35) with the kernel's per-thread local frame size.
+    # For non-recursive kernels (all OpenPTXas kernels), MIN_STACK == FRAME.
+    if frame_size:
+        buf[20:24] = struct.pack('<I', frame_size)
+        buf[32:36] = struct.pack('<I', frame_size)
     return bytes(buf)
 
 
@@ -434,6 +440,7 @@ class KernelDesc:
     exit_offset: int = 0x10  # byte offset of EXIT instruction in .text
     s2r_offset: int = 0x10  # byte offset of first S2R instruction in .text
     smem_size: int = 0           # static shared memory size in bytes (0 = none)
+    frame_size: int = 0          # per-thread .local frame size in bytes (0 = none)
     num_uniform: int = 14        # uniform register count for EIATTR 0x2f
     sm_version: int = 120        # 89 (Ada) or 120 (Blackwell)
     ptxas_capmerc: bytes | None = None    # capmerc from ptxas (overrides generated)
@@ -612,7 +619,7 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
         symtab_data,                 # 3
         _NOTE_TKINFO,                # 4
         _patch_cuinfo_sm(kernel.sm_version),  # 5
-        _build_nv_info_global(num_gprs=kernel.num_gprs, num_uniform=kernel.num_uniform),  # 6
+        _build_nv_info_global(num_gprs=kernel.num_gprs, num_uniform=kernel.num_uniform, frame_size=kernel.frame_size),  # 6
         _build_nv_compat(),          # 7
         _build_nv_info_kernel(num_gprs=kernel.num_gprs, num_params=kernel.num_params,
                               param_sizes=kernel.param_sizes, exit_offsets=exit_offsets,
@@ -661,7 +668,7 @@ def emit_cubin(kernel: KernelDesc) -> bytes:
     section_datas.extend([
         const0_data,
         capmerc_data,
-        _build_nv_info_global(num_gprs=kernel.num_gprs, num_uniform=kernel.num_uniform),
+        _build_nv_info_global(num_gprs=kernel.num_gprs, num_uniform=kernel.num_uniform, frame_size=kernel.frame_size),
         merc_info_data,
         merc_symtab_data,
     ])

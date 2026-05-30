@@ -235,6 +235,16 @@ class SharedDecl:
 
 
 @dataclass
+class LocalDecl:
+    """A .local variable declaration (per-thread stack-frame storage)."""
+    name:      str
+    align:     int   # alignment in bytes
+    elem_type: str   # e.g. 'b8', 'b32'
+    count:     int   # number of elements
+    size:      int   # total size in bytes (elem_size * count)
+
+
+@dataclass
 class Function:
     """A PTX kernel (.entry) or device function (.func)."""
     name:      str
@@ -243,6 +253,7 @@ class Function:
     reg_decls: list[RegDecl]         = field(default_factory=list)
     blocks:    list[BasicBlock]      = field(default_factory=list)
     shared_decls: list[SharedDecl]   = field(default_factory=list)
+    local_decls:  list[LocalDecl]    = field(default_factory=list)
 
     def all_instructions(self):
         for bb in self.blocks:

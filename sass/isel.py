@@ -1165,6 +1165,24 @@ def _select_mov(instr: Instruction, ra: RegAlloc,
                     SassInstr(encode_mov_imm(d_hi, 0),
                               f'MOV R{d_hi}, 0  // smem base hi'),
                 ], instr, ctx)
+        # mov.u64 %rd, _local_NN — per-thread stack-frame symbol.
+        # ptxas pattern: LDC R1 c[0][0x37c] ; IADD R1, R1, -frame_size.
+        # Then a local symbol at byte offset N within the frame is R1 + N.
+        # Emit `IADD3 R{lo}, R1, offset, RZ` (alias of R1 when offset=0).
+        # High 32 bits are RZ since SM_120 STL/LDL use only the low 32-bit
+        # half as the per-thread local address.
+        if isinstance(src, LabelOp) and ctx and hasattr(ctx, '_local_offsets'):
+            local_off = ctx._local_offsets.get(src.name, None)
+            if local_off is not None:
+                from sass.encoding.sm_120_opcodes import encode_iadd3_imm32 as _loc_iadd
+                d_lo = ra.lo(dest.name)
+                d_hi = d_lo + 1
+                return _apply_pred_byte([
+                    SassInstr(_loc_iadd(d_lo, 1, local_off & 0xFFFFFFFF, 255),
+                              f'IADD3 R{d_lo}, R1, 0x{local_off:x}, RZ  // local frame ptr lo'),
+                    SassInstr(encode_mov_imm(d_hi, 0),
+                              f'MOV R{d_hi}, 0  // local frame ptr hi (unused)'),
+                ], instr, ctx)
         raise ISelError(f"MOV src must be register: {src!r}")
 
     if typ in ('u64', 's64', 'b64', 'f64'):
