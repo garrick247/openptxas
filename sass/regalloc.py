@@ -123,6 +123,37 @@ def _find_ldg_coalesces(fn: Function) -> dict[str, tuple[str, int]]:
     return coalesces
 
 
+def _extend_live_across_backedges(fn, all_instrs, reg_first_def, reg_last_use):
+    """Extend each vreg's reg_last_use across loop back-edges.
+
+    A register read every iteration of a loop is live until the back-branch,
+    not just until its last textual appearance.  Without this extension,
+    the linear-scan allocator wrongly frees a loop-carried param's slot at
+    its last textual use, and the dead-write redirect wrongly RZ-rewrites
+    an intra-loop redefinition whose real next reader is the loop top.
+
+    Idempotent: extending an already-extended last-use is a no-op (the
+    comparison `loop_start <= last <= bra_idx` filters out lasts already at
+    or past the back-branch)."""
+    from ptx.ir import LabelOp
+    label_to_idx: dict[str, int] = {}
+    running_idx = 0
+    for bb in fn.blocks:
+        if bb.label:
+            label_to_idx[bb.label] = running_idx
+        running_idx += len(bb.instructions)
+    for bra_idx, inst in enumerate(all_instrs):
+        if inst.op != 'bra' or not inst.srcs or not isinstance(inst.srcs[0], LabelOp):
+            continue
+        loop_start = label_to_idx.get(inst.srcs[0].name, bra_idx + 1)
+        if loop_start > bra_idx:
+            continue  # forward branch — not a back-edge
+        for name, last in list(reg_last_use.items()):
+            first = reg_first_def.get(name, 0)
+            if first < loop_start and loop_start <= last <= bra_idx:
+                reg_last_use[name] = bra_idx
+
+
 def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
              has_capmerc: bool = False, sm_version: int = 120,
              skip_vregs: set | None = None,
@@ -245,6 +276,14 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 used_regs.add(_pn)
                 reg_last_use[_pn] = idx
 
+    # Loop back-edge extension MUST precede dead-write redirect: a vreg
+    # redefined inside a loop body that is read at the loop top next
+    # iteration looks dead on the forward-only linear scan, but its real
+    # last use is the back-branch.  Without this, bit_reverse_qm31's
+    # `mov.u32 %r12, %r19` (counter increment) was being redirected to RZ
+    # → MOV RZ, R17 → infinite loop.
+    _extend_live_across_backedges(fn, all_instrs, reg_first_def, reg_last_use)
+
     # === Dead-write redirection (narrow fix for the 0827506f-class clobber) ===
     # When a PTX vreg is written multiple times and a particular write has
     # no later read of that vreg (i.e., the write is dead), the emitted SASS
@@ -315,30 +354,9 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
         # Sentinel → RZ.  The linear scan won't see _DEAD_ in reg_decls.
         int_regs[_DEAD] = 255
 
-    # Extend live ranges across loop back-edges.  The linear scan above records
-    # only the last *forward* use; a register read every iteration of a loop is
-    # live until the back-branch, not just until its last textual appearance.
-    # Without this, the allocator wrongly reuses a param register (e.g. fd3/b)
-    # as workspace for an intra-loop temp (e.g. fd24) from the 2nd iteration on.
-    # Labels are on BasicBlock objects; build a map from label → first instr index.
-    label_to_idx: dict[str, int] = {}
-    running_idx = 0
-    for bb in fn.blocks:
-        if bb.label:
-            label_to_idx[bb.label] = running_idx
-        running_idx += len(bb.instructions)
-    for bra_idx, inst in enumerate(all_instrs):
-        if inst.op != 'bra' or not inst.srcs or not isinstance(inst.srcs[0], LabelOp):
-            continue
-        loop_start = label_to_idx.get(inst.srcs[0].name, bra_idx + 1)
-        if loop_start > bra_idx:
-            continue  # forward branch — not a back-edge
-        # Any register defined before the loop and used within the loop body is
-        # loop-carried: its live range must reach at least to the back-branch.
-        for name, last in list(reg_last_use.items()):
-            first = reg_first_def.get(name, 0)
-            if first < loop_start and loop_start <= last <= bra_idx:
-                reg_last_use[name] = bra_idx
+    # Extend live ranges across loop back-edges (helper applied here AND
+    # again after the dead-write rebuild below).
+    _extend_live_across_backedges(fn, all_instrs, reg_first_def, reg_last_use)
 
     next_pred = 0
     next_ur = 4
