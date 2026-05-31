@@ -123,119 +123,6 @@ def _find_ldg_coalesces(fn: Function) -> dict[str, tuple[str, int]]:
     return coalesces
 
 
-def _bb_level_liveness(fn, all_instrs, reg_first_def, reg_last_use):
-    """CFG-aware live-variable analysis: extend each vreg's reg_last_use to
-    cover all instructions in the LAST basic block where it is live (per
-    standard live_in/live_out dataflow fixpoint).
-
-    The existing back-edge extension at line ~318 is a SPECIAL CASE of this
-    (handles vregs def'd before a loop and used inside the loop).  This
-    helper generalizes to all CFG patterns — most notably the inverse
-    pattern where a vreg used in an inline block that's REACHED via bra
-    from later in the text but DEF'D EARLIER stays live across the
-    intervening loop body's instructions.
-
-    Conservative: only EXTENDS reg_last_use; never shrinks.  Safe to call
-    before any pass that consults reg_last_use, idempotent on rerun.
-    """
-    from ptx.ir import RegOp, MemOp, LabelOp
-
-    n_bb = len(fn.blocks)
-    if n_bb == 0:
-        return
-
-    # 1. Map labels to BB indices + record per-BB instruction-index range.
-    label_to_bb: dict[str, int] = {}
-    bb_start_idx: list[int] = []
-    bb_end_idx: list[int] = []  # exclusive
-    running = 0
-    for i, bb in enumerate(fn.blocks):
-        if bb.label:
-            label_to_bb[bb.label] = i
-        bb_start_idx.append(running)
-        running += len(bb.instructions)
-        bb_end_idx.append(running)
-
-    # 2. Compute successors per BB from terminator instructions.
-    successors: list[list[int]] = [[] for _ in range(n_bb)]
-    for i, bb in enumerate(fn.blocks):
-        if not bb.instructions:
-            if i + 1 < n_bb:
-                successors[i].append(i + 1)
-            continue
-        last = bb.instructions[-1]
-        if last.op == 'ret':
-            continue  # no successors
-        if last.op == 'bra':
-            tgt = None
-            if last.srcs and isinstance(last.srcs[0], LabelOp):
-                tgt = last.srcs[0].name
-            if tgt and tgt in label_to_bb:
-                successors[i].append(label_to_bb[tgt])
-            # Predicated bra also has fall-through.
-            if last.pred and i + 1 < n_bb:
-                successors[i].append(i + 1)
-            # Unconditional bra: no fall-through.
-        else:
-            # Non-terminator last instruction: fall through.
-            if i + 1 < n_bb:
-                successors[i].append(i + 1)
-
-    # 3. Compute use[BB] and def[BB].
-    use_bb: list[set] = [set() for _ in range(n_bb)]
-    def_bb: list[set] = [set() for _ in range(n_bb)]
-    for i, bb in enumerate(fn.blocks):
-        defined_so_far: set = set()
-        for inst in bb.instructions:
-            # Sources are reads — they're a "use" if not previously def'd in this BB.
-            for s in inst.srcs:
-                if isinstance(s, RegOp):
-                    if s.name not in defined_so_far:
-                        use_bb[i].add(s.name)
-                elif isinstance(s, MemOp) and s.base:
-                    bname = s.base if s.base.startswith('%') else f'%{s.base}'
-                    if bname not in defined_so_far:
-                        use_bb[i].add(bname)
-            # Predicate guard is also a read.
-            if inst.pred:
-                pn = inst.pred.lstrip('@').lstrip('!')
-                if pn.startswith('%') and pn not in defined_so_far:
-                    use_bb[i].add(pn)
-            # Dest is a def.
-            if inst.dest and isinstance(inst.dest, RegOp):
-                defined_so_far.add(inst.dest.name)
-                def_bb[i].add(inst.dest.name)
-
-    # 4. Iterate live_in/live_out to fixpoint.
-    live_in: list[set] = [set() for _ in range(n_bb)]
-    live_out: list[set] = [set() for _ in range(n_bb)]
-    changed = True
-    while changed:
-        changed = False
-        # Walk backwards through BBs — typically converges faster.
-        for i in range(n_bb - 1, -1, -1):
-            new_out: set = set()
-            for s in successors[i]:
-                new_out |= live_in[s]
-            new_in = use_bb[i] | (new_out - def_bb[i])
-            if new_in != live_in[i] or new_out != live_out[i]:
-                live_in[i] = new_in
-                live_out[i] = new_out
-                changed = True
-
-    # 5. For each vreg with a tracked last-use, extend to cover all
-    # instructions in the LAST BB where it is live (in or out).
-    for vreg_name in list(reg_last_use.keys()):
-        last_live_bb = -1
-        for i in range(n_bb):
-            if vreg_name in live_in[i] or vreg_name in live_out[i]:
-                last_live_bb = i
-        if last_live_bb >= 0:
-            new_last = bb_end_idx[last_live_bb] - 1
-            if new_last > reg_last_use[vreg_name]:
-                reg_last_use[vreg_name] = new_last
-
-
 def _extend_live_across_backedges(fn, all_instrs, reg_first_def, reg_last_use):
     """Extend each vreg's reg_last_use across loop back-edges.
 
@@ -389,15 +276,12 @@ def allocate(fn: Function, param_base: int = PARAM_BASE_SM120,
                 used_regs.add(_pn)
                 reg_last_use[_pn] = idx
 
-    # CFG-aware live-variable analysis runs BEFORE the dead-write redirect
-    # so the redirect's "is this write dead?" check sees the full liveness
-    # of vregs that are live-out across CFG edges (loop back-edges,
-    # inline-block-reached-via-forward-bra patterns, etc.).  Without this,
-    # the linear-scan view of last-use was too narrow and the redirect
-    # RZ'd writes whose real readers live downstream via control flow.
-    _bb_level_liveness(fn, all_instrs, reg_first_def, reg_last_use)
-    # Keep the narrower back-edge extension as a defense-in-depth pass
-    # (idempotent on already-extended ranges).
+    # Loop back-edge extension MUST precede dead-write redirect: a vreg
+    # redefined inside a loop body that is read at the loop top next
+    # iteration looks dead on the forward-only linear scan, but its real
+    # last use is the back-branch.  Without this, bit_reverse_qm31's
+    # `mov.u32 %r12, %r19` (counter increment) was being redirected to RZ
+    # → MOV RZ, R17 → infinite loop.
     _extend_live_across_backedges(fn, all_instrs, reg_first_def, reg_last_use)
 
     # === Dead-write redirection (narrow fix for the 0827506f-class clobber) ===
