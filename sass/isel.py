@@ -5514,6 +5514,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 if not hasattr(ctx, '_cvt_src_map'):
                                     ctx._cvt_src_map = {}
                                 ctx._cvt_src_map[d.name] = s_r
+                                # Mark dest as GPR-written (CSE path).
+                                if hasattr(ctx, '_gpr_written'):
+                                    ctx._gpr_written.add(d.name)
                                 continue
                             d_lo = ctx.ra.lo(d.name)
                             ctx._cvt_cache[s.name] = d_lo
@@ -5532,6 +5535,10 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             # not imm-form MOV with imm=0 (b1=0x78).
                             output.append(SassInstr(encode_mov(d_lo+1, RZ),
                                                     f'MOV R{d_lo+1}, RZ  // cvt.64.32 hi=0'))
+                            # Mark dest as GPR-written so subsequent ld/st (global or
+                            # local) using %dest as base reads from R{d_lo} not RZ.
+                            if hasattr(ctx, '_gpr_written'):
+                                ctx._gpr_written.add(d.name)
                         elif _is_64_dst and any(t == 's32' for t in instr.types[1:]):
                             # Sign-extend s32 → s64/u64/b64
                             # SHF.R.U32.HI d_hi, RZ, 31, s_r → d_hi = 0 or 1
@@ -5552,6 +5559,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             output.append(SassInstr(
                                 encode_shf_r_s32_hi(d_hi, s_r, 31),
                                 f'SHF.R.S32.HI R{d_hi}, RZ, 0x1f, R{s_r}  // cvt.s64.s32 sign'))
+                            # Mark dest as GPR-written (sign-extend path).
+                            if hasattr(ctx, '_gpr_written'):
+                                ctx._gpr_written.add(d.name)
                         else:
                             # General 32-bit and float conversions
                             _ROUNDING = {'rn','rz','rm','rp','rni','rzi','rmi','rpi'}
@@ -5756,6 +5766,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     # Phase 30 Part C: zero-ext via MOV (0x802) not IADD3 (0x810).
                                     output.append(SassInstr(encode_mov_imm(d_lo+1, 0),
                                                             f'MOV R{d_lo+1}, RZ  // cvt.{_dst_t}.{_src_t} zero-ext'))
+                                # Mark dest as GPR-written (duplicate 32→64 path).
+                                if hasattr(ctx, '_gpr_written'):
+                                    ctx._gpr_written.add(d.name)
                             else:
                                 # Unsupported cvt type combo — no encoder available.
                                 # Known gaps: f64↔s64, f64↔u64 (no SASS encoder),
