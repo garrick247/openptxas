@@ -5732,6 +5732,12 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     output.append(SassInstr(encode_iadd3(d_lo+1, a_lo+1, RZ, RZ),
                                                             f'MOV R{d_lo+1}, R{a_lo+1}  // cvt.{_dst_t}.{_src_t} hi'))
                                 # else: same register, nothing to do (NOP omitted)
+                                # Mark dest as GPR-written so subsequent ld.global/st.global
+                                # using %dest as the base address reads from its allocated
+                                # register (R{d_lo}) instead of falling through to RZ.
+                                # Smoking gun: batch_inverse_m31 PC 0x370 LDG.E [RZ.64].
+                                if hasattr(ctx, '_gpr_written'):
+                                    ctx._gpr_written.add(d.name)
                             elif _dst_t in _64B and _src_t in _32B:
                                 # 32→64 widening: zero-extend (u64.u32/b64.b32) or sign-extend (s64.s32)
                                 d_lo = ctx.ra.lo(d.name)
