@@ -4336,9 +4336,17 @@ def encode_lea(dest: int, base: int, index: int, scale: int = 0,
         ctrl:  23-bit scheduling control word.
     """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
-    return _build(0x11, 0x72,
-                  b2=dest, b3=base, b4=index,
-                  b8=RZ, b9=(scale & 0x1F), b10=0x00, b11=0x00,
+    # ptxas-validated byte layout for LEA (UR-source variant): the only
+    # LEA form ptxas emits on SM_120 (it never emits GPR-base LEA).  Reference:
+    # ptxas LEA R4,P0,R2,UR6,0x2 -> 11 7c 04 02 06 00 00 00 ff 10 80 0f 00 c8 1f 00.
+    # Field changes from the previous (rejected-by-nvdisasm) layout:
+    #   b1: 0x72 -> 0x7c (UR-source variant discriminator)
+    #   b3 / b4 swap: b3=index (src_a, GPR), b4=base (src_b, UR)
+    #   b9: (scale & 0x1F) -> ((scale & 0x07) << 3) so scale lands in bits 3-5
+    #   b10 / b11: 0x00 / 0x00 -> 0x80 / 0x0f (reserved bits ptxas sets)
+    return _build(0x11, 0x7c,
+                  b2=dest, b3=index, b4=base,
+                  b8=RZ, b9=((scale & 0x07) << 3), b10=0x80, b11=0x0f,
                   ctrl=ctrl)
 
 

@@ -255,21 +255,25 @@ from sass.encoding.sm_120_opcodes import (
 # --- LEA ---
 
 def test_lea_opcode():
+    # ptxas-validated layout: b3=index (src_a), b4=base (src_b),
+    # b9=(scale << 3) so scale lands in bits 3-5 of byte 9.
     raw = encode_lea(dest=5, base=2, index=3, scale=2)
-    assert _opcode(raw) == 0x211, f"opcode={_opcode(raw):#x}"
+    # ptxas-LEA bytes (11 7c) decode to opcode 0xc11; the old 0x211 was
+    # a hypothetical GPR-base LEA encoding hardware does not implement.
+    assert _opcode(raw) == 0xc11, f"opcode={_opcode(raw):#x}"
     assert raw[2] == 5   # dest
-    assert raw[3] == 2   # base
-    assert raw[4] == 3   # index
-    assert raw[9] == 2   # scale
+    assert raw[3] == 3   # index (src_a)
+    assert raw[4] == 2   # base (src_b)
+    assert raw[9] == 0x10  # scale=2 -> (2 << 3) = 0x10
     assert raw[8] == 0xFF  # RZ
 
 def test_lea_scale_0():
     raw = encode_lea(dest=10, base=0, index=7, scale=0)
-    assert raw[9] == 0   # scale=0 means no shift
+    assert raw[9] == 0   # scale=0 -> (0 << 3) = 0
 
 def test_lea_scale_4():
     raw = encode_lea(dest=4, base=1, index=6, scale=4)
-    assert raw[9] == 4   # scale=4 means <<4
+    assert raw[9] == 0x20  # scale=4 -> (4 << 3) = 0x20
 
 def test_lea_imm_opcode():
     raw = encode_lea_imm(dest=5, base=2, imm=0x100, scale=3)
