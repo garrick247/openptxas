@@ -919,6 +919,7 @@ def compile_function(fn: Function, verbose: bool = False,
     from ptx.passes.rotate32             import run_function as _rotate32_run
     from ptx.passes.cvta_eliminate       import run_function as _cvta_eliminate_run
     from ptx.passes.mul_distribute        import run_function as _mul_distribute_run
+    from ptx.passes.shl_distribute        import run_function as _shl_distribute_run
 
     # WB-pass-toggle (2026-04-28): allow workbench to disable individual
     # PTX-IR passes via the OPENPTXAS_DISABLE_PASSES env var (comma-
@@ -943,6 +944,7 @@ def compile_function(fn: Function, verbose: bool = False,
         # and BEFORE the chain-fold passes / IMAD.WIDE-fuse analyzer (in
         # compile_function) so they observe the rewritten chain.
         ("mul_distribute",          _mul_distribute_run),
+        ("shl_distribute",          _shl_distribute_run),
         ("load_cse",                _load_cse_run),
         ("add3_chain_reduce",       _add3_chain_reduce_run),
         ("mul3_chain_reduce",       _mul3_chain_reduce_run),
