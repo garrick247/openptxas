@@ -1085,8 +1085,22 @@ def compile_function(fn: Function, verbose: bool = False,
     # we reuse the result rather than re-running.
     from sass.isel import analyze_imad_wide_fuse
     _imad_wide_fuse_map = analyze_imad_wide_fuse(fn) if sm_version == 120 else {}
+    # Group fuse multipliers (K) per base param.  A base whose every fuse use
+    # has a power-of-two K with scale = log2(K) <= 4 is lowered by isel's
+    # UR-base LEA + LEA.HI.X pair (which reads the base straight from the
+    # uniform register), so it must STAY UR-resident — excluded from the
+    # IMAD.WIDE GPR-promotion below.  Bases with any non-LEA-eligible use
+    # (non-pow2 K, or scale > 4) still need a GPR addend for IMAD.WIDE.U32
+    # and keep the existing promotion.  Matches ptxas sm_120, which emits
+    # LEA for UR-param-base + idx*pow2 address arithmetic.
+    def _lea_ok(_k: int) -> bool:
+        return _k > 0 and (_k & (_k - 1)) == 0 and (_k.bit_length() - 1) <= 4
+    _base_mults: dict[str, list[int]] = {}
+    for _entry in _imad_wide_fuse_map.values():
+        _base_mults.setdefault(_entry[2], []).append(_entry[1])
     _imad_wide_fuse_bases: set[str] = {
-        _entry[2] for _entry in _imad_wide_fuse_map.values()
+        _b for _b, _ks in _base_mults.items()
+        if not all(_lea_ok(_k) for _k in _ks)
     }
 
     # 1. Register allocation

@@ -4404,7 +4404,7 @@ def encode_lea_imm(dest: int, base: int, imm: int, scale: int = 0,
 
 def encode_lea_hi_x(dest: int, src_a: int, src_b: int, src_c: int = RZ,
                     scale: int = 0, p_in: int = 0,
-                    ctrl: int = 0) -> bytes:
+                    ctrl: int = 0, ur_base: bool = False) -> bytes:
     """Encode LEA.HI.X dest, src_a, src_b, src_c, scale, P_in.
 
     The high-half companion to LEA: takes the carry predicate produced by
@@ -4413,11 +4413,19 @@ def encode_lea_hi_x(dest: int, src_a: int, src_b: int, src_c: int = RZ,
     Args:
         dest:   Destination register (high half).
         src_a:  Source A (the index that was shifted in the low LEA).
-        src_b:  Source B (the high half of the base address).
+        src_b:  Source B (the high half of the base address).  When
+                ``ur_base`` is set this is a uniform-register index.
         src_c:  Source C (carry-in input register, typically RZ=255).
         scale:  Shift amount (0..4).
         p_in:   Carry-in predicate index (0..7).
         ctrl:   23-bit scheduling control word.
+        ur_base: True when src_b is a uniform register (UR-resident base
+                pointer high half), the form ptxas pairs with the UR-source
+                ``encode_lea`` (0x7c) low half.  ptxas SM_120 ground truth
+                for `LEA.HI.X R3,R0,UR7,RZ,0x3,P0`:
+                  11 7c 03 00 07 00 00 00 ff 1c 0f 08 ...
+                Deltas from the all-GPR variant: opcode discriminator
+                0x72->0x7c, and the UR-source bit 0x08 set in b11.
     """
     if ctrl == 0:
         ctrl = _CTRL_DEFAULT
@@ -4425,7 +4433,11 @@ def encode_lea_hi_x(dest: int, src_a: int, src_b: int, src_c: int = RZ,
     b9 = ((scale & 0x07) << 3) | 0x04           # scale at bits 75..77, .HI at bit 74
     b10 = 0x0f | ((p & 0x01) << 7)              # fixed nibble + P_in[0]
     b11 = (p >> 1) & 0x03                       # P_in[1..2]
-    return _build(0x11, 0x72,
+    opc1 = 0x72
+    if ur_base:
+        opc1 = 0x7c                             # UR-source variant (matches encode_lea)
+        b11 |= 0x08                             # UR-source discriminator bit
+    return _build(0x11, opc1,
                   b2=dest, b3=src_a, b4=src_b,
                   b8=src_c & 0xFF,
                   b9=b9, b10=b10, b11=b11,

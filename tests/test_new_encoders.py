@@ -809,6 +809,30 @@ def test_lea_hi_x_byte_exact_p2():
         f"  got: {raw[0:13].hex()}\n  exp: {expected.hex()}"
     )
 
+def test_lea_hi_x_ur_base_byte_exact():
+    """UR-source variant: the high-half companion to encode_lea's 0x7c form.
+
+    ptxas SM_120 ground truth (fresh ptxas 13.3 on a param-base gather):
+        LEA      R2, P0, R0, UR6, 0x3
+        LEA.HI.X R3, R0, UR7, RZ, 0x3, P0
+          -> 11 7c 03 00 07 00 00 00 ff 1c 0f 08 ...
+    Deltas from the all-GPR variant: opcode 0x72->0x7c, UR-source bit 0x08
+    set in byte[11].
+    """
+    raw = encode_lea_hi_x(dest=3, src_a=0, src_b=7, src_c=255,
+                          scale=3, p_in=0, ur_base=True)
+    expected = bytes([0x11, 0x7c, 0x03, 0x00, 0x07, 0x00, 0x00, 0x00,
+                      0xff, 0x1c, 0x0f, 0x08])
+    assert raw[0:12] == expected, (
+        f"UR-base LEA.HI.X byte mismatch:\n"
+        f"  got: {raw[0:12].hex()}\n  exp: {expected.hex()}"
+    )
+
+def test_lea_hi_x_ur_base_no_gpr_regression():
+    """ur_base defaults False — the all-GPR variant must be unchanged."""
+    g = encode_lea_hi_x(dest=7, src_a=0, src_b=12, src_c=11, scale=1, p_in=0)
+    assert g[1] == 0x72 and (g[11] & 0x08) == 0, "GPR variant regressed"
+
 def test_lea_hi_x_scale_and_hi_flag():
     """byte[9] bit 2 (= bit 74) is the .HI flag; scale lives at bits 75..77."""
     for scale in (0, 1, 2, 3, 4):

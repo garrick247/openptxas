@@ -90,6 +90,7 @@ from sass.encoding.sm_120_opcodes import (
     encode_utmaldg_1d, encode_utmaldg_2d, encode_utmastg_1d,
     encode_utmacmdflush, encode_elect, encode_cctl_ivall,
     encode_mov_gpr_from_ur,
+    encode_lea, encode_lea_hi_x,
     encode_iadd3_imm32, encode_iadd3_imm32_neg_src0, encode_mov_imm,
     encode_iadd3_neg_b4, encode_iadd3_neg_b3,
     encode_iadd3_pred_neg_b4, encode_iadd3_pred_small_imm,
@@ -714,7 +715,7 @@ def analyze_imad_wide_fuse(fn) -> dict:
     (IADD3-imm-lo + IADD3-imm-hi + IMAD.WIDE-RR + IADD.64-R-UR) with
     1 instruction (or 1+2 MOVs when the base is UR-only).
     """
-    from ptx.ir import RegOp, ImmOp
+    from ptx.ir import RegOp, ImmOp, MemOp
 
     all_instrs = []
     for bb in fn.blocks:
@@ -724,6 +725,13 @@ def analyze_imad_wide_fuse(fn) -> dict:
     def_count: dict[str, int] = {}
     use_count: dict[str, int] = {}
     def_instr: dict[str, object] = {}
+    # Vregs used as the MemOp.base of a GLOBAL ld/st/atom — i.e. a real
+    # effective address.  The non-hi-zero LEA path only fuses an add.u64
+    # whose result is such a base; otherwise (an intermediate arithmetic
+    # add) emitting LEA both overshoots ptxas AND, in heavily-reused-vreg
+    # FORGE kernels, miswires the address (the LEA dest is not what the
+    # consuming load reads).  The hi-zero path keeps its prior behaviour.
+    global_base_vregs: set[str] = set()
     for inst in all_instrs:
         if isinstance(inst.dest, RegOp):
             n = inst.dest.name
@@ -737,6 +745,10 @@ def analyze_imad_wide_fuse(fn) -> dict:
                 base = getattr(src, 'base', None)
                 if isinstance(base, str) and base.startswith('%'):
                     use_count[base] = use_count.get(base, 0) + 1
+                    if (isinstance(src, MemOp)
+                            and inst.op in ('ld', 'st', 'atom')
+                            and 'global' in (inst.types or ())):
+                        global_base_vregs.add(base)
 
     def _idx_hi_zero(idx_name: str) -> bool:
         """Check whether the high 32 bits of idx_name are statically zero."""
@@ -783,7 +795,7 @@ def analyze_imad_wide_fuse(fn) -> dict:
             return (df.srcs[0].value & 0xFFFFFFFFFFFFFFFF, id(df))
         return None
 
-    fuse_map: dict[int, tuple[str, int, str, str, int, int | None]] = {}
+    fuse_map: dict[int, tuple[str, int, str, str, int, int | None, bool]] = {}
     # Walk pairs of (mul, add) within the same BB.  The add must be the
     # *first* use of the mul dest; if any earlier instr (including the
     # mul itself) uses %M, that's surprising — bail.  We iterate over BB
@@ -832,7 +844,18 @@ def analyze_imad_wide_fuse(fn) -> dict:
             if K == 0 or (K >> 32) != 0:
                 continue
             mul_dest = inst.dest.name
-            if not _idx_hi_zero(idx_op.name):
+            _hi_zero = _idx_hi_zero(idx_op.name)
+            # CONSERVATIVE GATE (see project_openptxas.md 2026-06-12): the
+            # non-hi-zero LEA case is blocked on an offset-through-shift
+            # distribution pass.  ptxas computes ONE base address + folded
+            # constant limb offsets where the FORGE PTX has N per-limb
+            # `(idx+c)<<s` computations; without distributing `c<<s` out as a
+            # foldable offset, fusing the per-limb adds overshoots ptxas
+            # (bit_reverse 4->16, gather 8->16) — proven by before/after diff.
+            # The "final effective-address only" constraint (global_base_vregs)
+            # is necessary but NOT sufficient (after5 experiment).  Keep the
+            # hi-zero-only gate until the distribution pass exists.
+            if not _hi_zero:
                 continue
             # Local live-range walk replaces the global def_count/use_count
             # checks (which were too conservative for non-SSA PTX such as
@@ -897,8 +920,14 @@ def analyze_imad_wide_fuse(fn) -> dict:
                         break
             if base_clobbered:
                 continue
+            # Non-hi-zero: only fuse when the add's result is a real global
+            # effective address (consumed as a ld/st/atom base).  Fusing an
+            # intermediate arithmetic add would miswire the address in
+            # reused-vreg FORGE kernels (LEA dest != the reg the load reads).
+            if not _hi_zero and add_inst.dest.name not in global_base_vregs:
+                continue
             fuse_map[id(inst)] = (idx_op.name, K, base, add_inst.dest.name,
-                                  id(add_inst), dead_mov_id)
+                                  id(add_inst), dead_mov_id, _hi_zero)
 
     return fuse_map
 
@@ -921,11 +950,52 @@ def _emit_imad_wide_fused(instr, ctx, output, op_label: str = 'fused') -> bool:
     if id(instr) not in _fuse_map:
         return False
     (_idx_name, _K, _base_name, _fused_dest_name,
-     _add_id, _dead_mov_id) = _fuse_map[id(instr)]
+     _add_id, _dead_mov_id, _idx_hi_zero) = _fuse_map[id(instr)]
     _idx_lo = ctx.ra.lo(_idx_name)
     _final_lo = ctx.ra.lo(_fused_dest_name)
     _gw = getattr(ctx, '_gpr_written', set())
     _ur = getattr(ctx, '_ur_params', {})
+
+    # --- UR-base LEA pair (matches ptxas sm_120) ---------------------------
+    # When the base pointer is still UR-resident and the multiplier K is a
+    # power of two with scale = log2(K) <= 4, ptxas keeps the base in the
+    # uniform register and emits a LEA + LEA.HI.X pair (shift fused into the
+    # address-add), rather than materializing the base into GPRs + IMAD.WIDE.
+    # LEA.HI.X's src_c carries the index's high half: RZ when the index is
+    # zero-extended, else idx.hi (the non-hi-zero case ptxas threads through
+    # R7 in batch_inverse/fold_line).  encode_lea forces its carry-out to P0,
+    # which LEA.HI.X consumes; safe because P0 is free at an address-compute
+    # site in the FORGE-emitted gather/fold kernels.
+    _base_is_ur = (_base_name in _ur) and (_base_name not in _gw)
+    _scale = (_K.bit_length() - 1) if (_K > 0 and (_K & (_K - 1)) == 0) else -1
+    if _base_is_ur and 0 <= _scale <= 4:
+        _ur_base = _ur[_base_name]
+        _final_hi = _final_lo + 1
+        _src_c = RZ if _idx_hi_zero else ctx.ra.hi(_idx_name)
+        _src_c_txt = 'RZ' if _idx_hi_zero else f'R{_src_c}'
+        output.append(SassInstr(
+            encode_lea(_final_lo, _ur_base, _idx_lo, _scale),
+            f'LEA R{_final_lo}, P0, R{_idx_lo}, UR{_ur_base}, 0x{_scale:x}'
+            f'  // {op_label}: UR-base addr lo'))
+        output.append(SassInstr(
+            encode_lea_hi_x(_final_hi, _idx_lo, _ur_base + 1, _src_c,
+                            scale=_scale, p_in=0, ur_base=True),
+            f'LEA.HI.X R{_final_hi}, R{_idx_lo}, UR{_ur_base + 1}, {_src_c_txt}, '
+            f'0x{_scale:x}, P0  // {op_label}: UR-base addr hi'))
+        if hasattr(ctx, '_gpr_written'):
+            ctx._gpr_written.add(_fused_dest_name)
+        if not hasattr(ctx, '_skip_instrs'):
+            ctx._skip_instrs = set()
+        ctx._skip_instrs.add(_add_id)
+        return True
+
+    # Non-hi-zero indices have NO correct IMAD.WIDE.U32 lowering (it would
+    # drop the high 32 index bits).  If the LEA path above didn't fire for
+    # such an entry (base not UR-resident), do NOT fuse — return False so the
+    # generic full-64-bit shl/add lowering handles it correctly.
+    if not _idx_hi_zero:
+        return False
+
     if (_base_name not in _ur) or (_base_name in _gw):
         # Already GPR-resident (or never UR-bound).
         _base_lo = ctx.ra.lo(_base_name)
