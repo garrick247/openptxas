@@ -1,49 +1,59 @@
 """
 Offset-through-shift distribution for FORGE per-limb address chains.
 
-ptxas 13.3 lowers `base + (idx*2^S1 + k)*2^S2` (the per-limb effective
-address FORGE emits, with k a small constant differing per limb) to a
-SINGLE shared base address `base + idx*2^(S1+S2)` plus a constant memory
-offset `k*2^S2` folded into each LDG/STG.  openptxas instead computes a
-full address per limb, which downstream emits one LEA pair (or IMAD.WIDE)
-per limb instead of one shared address + cheap offset loads.
+ptxas 13.3 lowers the FORGE per-limb effective address
+    base + (idx*2^S1 + k) * 2^S2
+to a single shared base  base + idx*2^(S1+S2)  plus a constant memory
+offset  k*2^S2  folded into each LDG/STG.  openptxas computes a full
+address per limb instead, emitting an extra LEA pair (or IMAD.WIDE) per
+limb where ptxas reuses one base + a cheap offset.
 
-This pass performs the algebraically-exact rewrite at the PTX-IR level:
+This pass performs the algebraically-exact PTX-IR rewrite.  Anchored on
+the OUTER shift  shl %M2, %A, S2  (which unifies both forms):
 
-    shl.b64  %M1, %X, S1          (M1 = idx << S1; may be multi-used, kept)
-    add.u64  %A,  %M1, K          (A single-use; K a small u64 immediate)
-    shl.b64  %M2, %A,  S2         (M2 single-use)
-    add.u64  %F,  %B,  %M2        (F single-use, only as a global ld/st base)
-    ld/st.global [%F], ...
+  k != 0 (per-limb):
+    shl %M1,%X,S1 ; add %A,%M1,k ; shl %M2,%A,S2 ; add %F,%B,%M2 ; ld/st [%F]
+  k == 0 (slot 0):
+    shl %M1,%X,S1 ;               shl %M2,%M1,S2 ; add %F,%B,%M2 ; ld/st [%F]
 
-  =>
+  =>  shl %Mn,%X,(S1+S2) ; add %F,%B,%Mn ; ld/st [%F + (k<<S2)]
 
-    shl.b64  %Mn, %X, (S1+S2)     (fresh; idx << (S1+S2))
-    add.u64  %F,  %B, %Mn         (consumer rebased onto %Mn)
-    ld/st.global [%F + (K << S2)], ...
+using  (idx*2^S1 + k)*2^S2 == idx*2^(S1+S2) + k*2^S2  (exact mod 2^64).
+The combined  %X<<(S1+S2)  then feeds the committed idx_hi_zero UR-base
+LEA selection (X is the hi-zero loop index); k<<S2 folds into the memop.
 
-  using the identity  (idx*2^S1 + K) * 2^S2 == idx*2^(S1+S2) + K*2^S2,
-  which holds exactly in modular 2^64 arithmetic (shifts and adds wrap
-  consistently).  The constant K*2^S2 is folded straight into the memory
-  operand offset; `%X << (S1+S2)` then feeds the UR-base LEA selection
-  (idx_hi_zero path) the same way `mul_distribute` feeds IMAD.WIDE.
+# Block-local liveness (handles FORGE's heavily-reused vreg names)
+Gating is computed per basic block over instruction windows, NOT via
+function-wide def/use counts (which reject reused names outright):
+- %M2's only reader in [def, next-redef) is the consumer add  -> safe to
+  rebase the consumer and drop %M2's def.
+- %F's only reader in its window is one global ld/st MemOp base  -> safe to
+  fold the constant offset into exactly that memory op.
+- k != 0: %A's only reader in its window is the outer shift  -> the leading
+  add is dead after rewrite.  (%M1 may be shared across limbs; preserved.)
+- k == 0: %M1 (= %A) may be shared; we never delete it, only add %Mn.
+- %X must not be rewritten between its source shift and the insertion point.
+- k<<S2 must fit the signed 24-bit LDG.E/STG.E offset; S1+S2 in [1,31].
 
-Cross-limb sharing of `%B + %X<<(S1+S2)` is left to the existing CSE
-passes (cvt_shl_cse / common_mul_sum / load_cse), exactly as mul_distribute
-relies on downstream folding.
+Toggle: OFF unless OPENPTXAS_ENABLE_SHL_DISTRIBUTE is set (staged; gated so
+the default path is byte-identical until GPU-validated on linux via
+/tmp/driver.py — see project_openptxas.md).
 
-# Conservative gating (correctness)
-- %A single-def AND single-use (only by the second shl).
-- %M2 single-def AND single-use (only by the consumer add).
-- %F single-def AND single-use, and that use is a global ld/st MemOp base.
-- %M1's defining shl is unpredicated (we read %X unconditionally).
-- The chain instructions share one predicate; new instrs inherit it.
-- K << S2 must fit the 24-bit signed LDG.E/STG.E offset range.
-- S1+S2 in [1,63]; the combined shift must not be a no-op.
-
-Toggle: this pass is OFF unless OPENPTXAS_ENABLE_SHL_DISTRIBUTE is set
-(staged building block — see project_openptxas.md; needs kraken runtime
-validation before it becomes default).
+FINDING 2026-06-13 — this is NOT the shape ptxas emits (do not chase
+byte-parity with it).  ptxas 13.3 does NOT combine the two shifts: for
+bit_reverse it keeps `R6 = revidx<<2` (IMAD.SHL + SHF.R.HI, so R6:R7 is
+non-zero-extended) and emits `LEA R4, R6, base, 0x2` + `LEA.HI.X R5, R6,
+base_hi, R7, 0x2` — i.e. a NON-HI-ZERO UR-base LEA on the *intermediate*
+shifted index (src_c = R7 = the index's high half).  This pass instead
+folds to `revidx<<(S1+S2)` (hi-zero), a valid but DIFFERENT cubin that
+won't byte-match.  It also barely fires on real FORGE kernels because the
+index vreg is typically clobbered before the address compute (the
+stability check correctly bails).  The real path to ptxas-13.3 parity is
+the non-hi-zero UR-base LEA selection (encode_lea_hi_x already supports
+src_c=idx.hi via ur_base=True) + constant-offset folding that replicates
+ptxas's per-site choices — NOT shift distribution.  Kept as a correct,
+gated, isolation-tested transform (useful for a future non-byte-exact
+instruction-reduction mode), not for parity.
 """
 from __future__ import annotations
 
@@ -62,42 +72,16 @@ def _is_i64(inst: Instruction) -> bool:
     return bool(inst.types) and any(t in _INT64 for t in inst.types)
 
 
-def _walk(fn: Function):
-    def_count: dict[str, int] = {}
-    use_count: dict[str, int] = {}
-    def_instr: dict[str, Instruction] = {}
-    global_base: set[str] = set()
-    for bb in fn.blocks:
-        for inst in bb.instructions:
-            d = inst.dest
-            if isinstance(d, VectorRegOp):
-                for r in (d.regs or ()):
-                    def_count[r] = def_count.get(r, 0) + 1
-                    def_instr[r] = inst
-            elif isinstance(d, RegOp):
-                def_count[d.name] = def_count.get(d.name, 0) + 1
-                def_instr[d.name] = inst
-            for src in (inst.srcs or []):
-                if isinstance(src, RegOp) and not isinstance(src, VectorRegOp):
-                    use_count[src.name] = use_count.get(src.name, 0) + 1
-                elif isinstance(src, MemOp):
-                    b = src.base
-                    if isinstance(b, str) and b:
-                        # MemOp.base may be stored with or without the % sigil;
-                        # normalise to the %-form used by RegOp.name.
-                        bn = b if b.startswith('%') else f'%{b}'
-                        use_count[bn] = use_count.get(bn, 0) + 1
-                        if (inst.op in ('ld', 'st', 'atom')
-                                and 'global' in (inst.types or ())):
-                            global_base.add(bn)
-    return def_count, use_count, def_instr, global_base
+def _writes(inst: Instruction, name: str) -> bool:
+    d = inst.dest
+    if isinstance(d, VectorRegOp):
+        return name in (d.regs or ())
+    return isinstance(d, RegOp) and d.name == name
 
 
 def _shl_of(inst: Instruction):
-    """If inst is `shl.b64 %D, %X, S_imm`, return (D_name, X_reg, S). Else None."""
-    if inst is None or inst.op != "shl" or not _is_i64(inst):
-        return None
-    if inst.mods:
+    """`shl.b64 %D, %X, S_imm` -> (D_name, X_RegOp, S).  Else None."""
+    if inst is None or inst.op != "shl" or not _is_i64(inst) or inst.mods:
         return None
     if not isinstance(inst.dest, RegOp) or isinstance(inst.dest, VectorRegOp):
         return None
@@ -109,6 +93,60 @@ def _shl_of(inst: Instruction):
     if not isinstance(s, ImmOp):
         return None
     return (inst.dest.name, x, s.value)
+
+
+def _add_imm_of(inst: Instruction):
+    """`add.u64 %A, %M1, K_imm` -> (A_name, M1_RegOp, K).  Either src order."""
+    if inst is None or inst.op != "add" or not _is_i64(inst) or inst.mods:
+        return None
+    if not isinstance(inst.dest, RegOp) or isinstance(inst.dest, VectorRegOp):
+        return None
+    if len(inst.srcs or []) != 2:
+        return None
+    a, b = inst.srcs
+    if isinstance(a, RegOp) and not isinstance(a, VectorRegOp) and isinstance(b, ImmOp):
+        return (inst.dest.name, a, b.value)
+    if isinstance(b, RegOp) and not isinstance(b, VectorRegOp) and isinstance(a, ImmOp):
+        return (inst.dest.name, b, a.value)
+    return None
+
+
+def _last_write_before(instrs, idx, name) -> Optional[int]:
+    for j in range(idx - 1, -1, -1):
+        if _writes(instrs[j], name):
+            return j
+    return None
+
+
+def _next_write_after(instrs, idx, name) -> int:
+    for j in range(idx + 1, len(instrs)):
+        if _writes(instrs[j], name):
+            return j
+    return len(instrs)
+
+
+def _reg_readers(instrs, lo, hi, name):
+    """Positions in [lo,hi) reading `name` as a RegOp source."""
+    out = []
+    for j in range(lo, hi):
+        for s in (instrs[j].srcs or []):
+            if isinstance(s, RegOp) and not isinstance(s, VectorRegOp) and s.name == name:
+                out.append(j)
+                break
+    return out
+
+
+def _membase_readers(instrs, lo, hi, name):
+    """Positions in [lo,hi) using `name` as a MemOp base (sigil-normalised)."""
+    out = []
+    for j in range(lo, hi):
+        for s in (instrs[j].srcs or []):
+            if isinstance(s, MemOp) and isinstance(s.base, str):
+                bn = s.base if s.base.startswith('%') else f'%{s.base}'
+                if bn == name:
+                    out.append(j)
+                    break
+    return out
 
 
 def _alloc_vreg(fn: Function) -> str:
@@ -126,125 +164,140 @@ def _alloc_vreg(fn: Function) -> str:
 def run_function(fn: Function) -> int:
     if not os.environ.get("OPENPTXAS_ENABLE_SHL_DISTRIBUTE"):
         return 0
-    def_count, use_count, def_instr, global_base = _walk(fn)
     n = 0
     for bb in fn.blocks:
         instrs = bb.instructions
         i = 0
         while i < len(instrs):
-            # Anchor on the leading add: `[@p] add.u64 %A, %M1, K`.
-            cand = instrs[i]
-            if cand.op != "add" or not _is_i64(cand) or cand.mods:
+            sh2 = _shl_of(instrs[i])             # outer shift: %M2 = %A << S2
+            if sh2 is None:
                 i += 1
                 continue
-            if not isinstance(cand.dest, RegOp) or isinstance(cand.dest, VectorRegOp):
+            m2_name, a_op, S2 = sh2
+            a_name = a_op.name
+            pred = (instrs[i].pred, instrs[i].neg)
+
+            a_def_idx = _last_write_before(instrs, i, a_name)
+            if a_def_idx is None:
                 i += 1
                 continue
-            if len(cand.srcs or []) != 2:
+            a_def = instrs[a_def_idx]
+
+            # Resolve (X, S1, K, m1_name, is_k0).
+            shl_a = _shl_of(a_def)
+            add_a = _add_imm_of(a_def)
+            if shl_a is not None:
+                # k == 0 slot: %A is itself idx<<S1.  %A/%M1 may be shared.
+                m1_name, x_op, S1 = shl_a
+                K = 0
+                is_k0 = True
+            elif add_a is not None:
+                # k != 0: %A = %M1 + K ; %M1 must be defined by a shift.
+                _aname, m1_op, K = add_a
+                m1_name = m1_op.name
+                m1_def_idx = _last_write_before(instrs, a_def_idx, m1_name)
+                if m1_def_idx is None:
+                    i += 1
+                    continue
+                shl_m1 = _shl_of(instrs[m1_def_idx])
+                if shl_m1 is None:
+                    i += 1
+                    continue
+                _m1n, x_op, S1 = shl_m1
+                is_k0 = False
+                # %A's only reader in its live range must be this outer shift.
+                a_end = _next_write_after(instrs, a_def_idx, a_name)
+                if _reg_readers(instrs, a_def_idx + 1, a_end, a_name) != [i]:
+                    i += 1
+                    continue
+            else:
                 i += 1
                 continue
-            a_name = cand.dest.name
-            if def_count.get(a_name, 0) != 1 or use_count.get(a_name, 0) != 1:
+
+            S = S1 + S2
+            if S < 1 or S > 31:           # (1<<S) must stay u32 for the LEA scale chain
                 i += 1
                 continue
-            # Identify %M1 (a shl.b64 result) and K (small u64 immediate).
-            m1_op = k_imm = None
-            for src in cand.srcs:
-                if isinstance(src, RegOp) and not isinstance(src, VectorRegOp):
-                    df = def_instr.get(src.name)
-                    if df is not None and _shl_of(df) is not None:
-                        m1_op = src
-            if m1_op is None:
+
+            # Consumer add: the unique reader of %M2 in its window.
+            m2_end = _next_write_after(instrs, i, m2_name)
+            m2_readers = _reg_readers(instrs, i + 1, m2_end, m2_name)
+            if len(m2_readers) != 1:
                 i += 1
                 continue
-            other = cand.srcs[0] if cand.srcs[1] is m1_op else cand.srcs[1]
-            if not isinstance(other, ImmOp):
-                i += 1
-                continue
-            K = other.value & 0xFFFFFFFFFFFFFFFF
-            m1 = _shl_of(def_instr[m1_op.name])
-            if m1 is None:
-                i += 1
-                continue
-            _m1name, x_reg, S1 = m1
-            if def_instr[m1_op.name].pred is not None:
-                i += 1
-                continue
-            # Second shl: `[@p] shl.b64 %M2, %A, S2` must follow.
-            if i + 1 >= len(instrs):
-                i += 1
-                continue
-            sh2 = _shl_of(instrs[i + 1])
-            if sh2 is None or instrs[i + 1].srcs[0].name != a_name:
-                i += 1
-                continue
-            m2_name, _a2, S2 = sh2
-            if (instrs[i + 1].pred, instrs[i + 1].neg) != (cand.pred, cand.neg):
-                i += 1
-                continue
-            if def_count.get(m2_name, 0) != 1 or use_count.get(m2_name, 0) != 1:
-                i += 1
-                continue
-            # Consumer add: `[@p] add.u64 %F, %B, %M2`.
-            if i + 2 >= len(instrs):
-                i += 1
-                continue
-            cadd = instrs[i + 2]
+            cidx = m2_readers[0]
+            cadd = instrs[cidx]
             if cadd.op != "add" or not _is_i64(cadd) or cadd.mods:
                 i += 1
                 continue
-            if (cadd.pred, cadd.neg) != (cand.pred, cand.neg):
+            if (cadd.pred, cadd.neg) != pred:
                 i += 1
                 continue
             if len(cadd.srcs or []) != 2 or not isinstance(cadd.dest, RegOp):
                 i += 1
                 continue
-            ca, cb = cadd.srcs[0], cadd.srcs[1]
-            if isinstance(ca, RegOp) and ca.name == m2_name and isinstance(cb, RegOp):
+            ca, cb = cadd.srcs
+            if isinstance(ca, RegOp) and ca.name == m2_name and isinstance(cb, RegOp) \
+                    and not isinstance(cb, VectorRegOp):
                 b_reg = cb
-            elif isinstance(cb, RegOp) and cb.name == m2_name and isinstance(ca, RegOp):
+            elif isinstance(cb, RegOp) and cb.name == m2_name and isinstance(ca, RegOp) \
+                    and not isinstance(ca, VectorRegOp):
                 b_reg = ca
             else:
                 i += 1
                 continue
             f_name = cadd.dest.name
-            if def_count.get(f_name, 0) != 1 or use_count.get(f_name, 0) != 1:
+
+            # %F's unique reader in its window must be one global ld/st base.
+            f_end = _next_write_after(instrs, cidx, f_name)
+            if _reg_readers(instrs, cidx + 1, f_end, f_name):
+                i += 1
+                continue                  # %F used as a value, not just an address
+            f_bases = _membase_readers(instrs, cidx + 1, f_end, f_name)
+            if len(f_bases) != 1:
                 i += 1
                 continue
-            if f_name not in global_base:
+            ld_idx = f_bases[0]
+            ldst = instrs[ld_idx]
+            if ldst.op not in ('ld', 'st', 'atom') or 'global' not in (ldst.types or ()):
                 i += 1
                 continue
-            # Offset = K << S2; must fit the signed 24-bit memop offset.
-            S = S1 + S2
-            if S < 1 or S > 63 or (1 << S) >> 32 != 0:
+
+            # %X must be stable between its source shift and the insertion point i.
+            x_src_idx = m1_def_idx if not is_k0 else a_def_idx
+            if _last_write_before(instrs, i + 1, x_op.name) != \
+                    _last_write_before(instrs, x_src_idx + 1, x_op.name):
                 i += 1
                 continue
+
+            # Offset = K << S2, folded into the memory operand.
             off = (K << S2) & 0xFFFFFFFFFFFFFFFF
             soff = off - (1 << 64) if off >= (1 << 63) else off
-            if not (_OFF_MIN <= soff <= _OFF_MAX):
+            # Locate the target memop and its existing offset.
+            tgt = None
+            for si, s in enumerate(ldst.srcs or []):
+                if isinstance(s, MemOp) and isinstance(s.base, str):
+                    bn = s.base if s.base.startswith('%') else f'%{s.base}'
+                    if bn == f_name:
+                        tgt = (si, s)
+                        break
+            if tgt is None:
                 i += 1
                 continue
+            si, memop = tgt
+            new_off = memop.offset + soff
+            if not (_OFF_MIN <= new_off <= _OFF_MAX):
+                i += 1
+                continue
+
             # --- Rewrite -----------------------------------------------------
-            # new shl: %Mn = %X << S    (S = S1+S2)
             mn = _alloc_vreg(fn)
-            new_shl = Instruction(op="shl", types=["b64"],
-                                  dest=RegOp(mn),
-                                  srcs=[RegOp(x_reg.name), ImmOp(S)],
-                                  pred=cand.pred, neg=cand.neg)
-            # consumer add rebased: %F = %B + %Mn
-            cadd.srcs = [RegOp(b_reg.name), RegOp(mn)]
-            # fold K<<S2 into the memory op that bases on %F
-            for inst in instrs:
-                for si, src in enumerate(inst.srcs or []):
-                    if (isinstance(src, MemOp) and isinstance(src.base, str)
-                            and (src.base == f_name
-                                 or src.base == f_name.lstrip('%')
-                                 or f'%{src.base}' == f_name)):
-                        inst.srcs[si] = MemOp(base=src.base, offset=src.offset + soff)
-            # Replace the leading add + second shl with the single new shl;
-            # the original first shl (%M1) is preserved (often multi-used).
-            instrs[i] = new_shl          # was: add %A,%M1,K
-            del instrs[i + 1]            # was: shl %M2,%A,S2
+            new_shl = Instruction(op="shl", types=["b64"], dest=RegOp(mn),
+                                  srcs=[RegOp(x_op.name), ImmOp(S)],
+                                  pred=instrs[i].pred, neg=instrs[i].neg)
+            instrs[i] = new_shl                       # replace outer shift in place
+            cadd.srcs = [RegOp(b_reg.name), RegOp(mn)]  # %F = %B + %Mn
+            ldst.srcs[si] = MemOp(base=memop.base, offset=new_off)
             n += 1
             i += 1
     return n
