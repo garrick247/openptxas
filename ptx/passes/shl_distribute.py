@@ -1,59 +1,43 @@
 """
-Offset-through-shift distribution for FORGE per-limb address chains.
+Per-limb address coalescing for FORGE store/gather kernels (matches the
+shape ptxas 13.3 emits).
 
-ptxas 13.3 lowers the FORGE per-limb effective address
-    base + (idx*2^S1 + k) * 2^S2
-to a single shared base  base + idx*2^(S1+S2)  plus a constant memory
-offset  k*2^S2  folded into each LDG/STG.  openptxas computes a full
-address per limb instead, emitting an extra LEA pair (or IMAD.WIDE) per
-limb where ptxas reuses one base + a cheap offset.
+FORGE emits, per limb k, a full effective-address chain
+    [ add %A,%M1,k ; ]  shl %M2,%A,S2 ; add %F,%B,%M2 ; ld/st [%F]
+where %M1 = X<<S1 is a shared intermediate index, %B a base pointer, and k
+a small per-limb constant.  ptxas keeps %M1 as the LEA index, scales by the
+OUTER shift S2, and collapses all limbs sharing (%M1, S2, %B) to ONE base
+address  %B + %M1<<S2  plus a folded per-limb memory offset  k<<S2.
 
-This pass performs the algebraically-exact PTX-IR rewrite.  Anchored on
-the OUTER shift  shl %M2, %A, S2  (which unifies both forms):
-
-  k != 0 (per-limb):
-    shl %M1,%X,S1 ; add %A,%M1,k ; shl %M2,%A,S2 ; add %F,%B,%M2 ; ld/st [%F]
-  k == 0 (slot 0):
-    shl %M1,%X,S1 ;               shl %M2,%M1,S2 ; add %F,%B,%M2 ; ld/st [%F]
-
-  =>  shl %Mn,%X,(S1+S2) ; add %F,%B,%Mn ; ld/st [%F + (k<<S2)]
-
-using  (idx*2^S1 + k)*2^S2 == idx*2^(S1+S2) + k*2^S2  (exact mod 2^64).
-The combined  %X<<(S1+S2)  then feeds the committed idx_hi_zero UR-base
-LEA selection (X is the hi-zero loop index); k<<S2 folds into the memop.
+This pass reproduces that structure at the PTX-IR level, using
+  (X*2^S1 + k) * 2^S2 == (X*2^S1)*2^S2 + k*2^S2   (exact mod 2^64).
+For the first limb of each (%M1,S2,%B,pred) group it emits, into FRESH
+vregs (so the shared base is never clobbered by FORGE's vreg reuse):
+    shl %Mn,%M1,S2 ; add %Fsh,%B,%Mn ; ld/st [%Fsh + k<<S2]
+and every later limb in the group reuses %Fsh:  ld/st [%Fsh + k<<S2],
+dropping its now-dead add/shl/add chain.  The kept index is %M1 (= X<<S1,
+NON-zero-extended) — exactly what ptxas feeds to the non-hi-zero UR-base
+LEA (see isel _emit_imad_wide_fused, src_c = idx.hi).
 
 # Block-local liveness (handles FORGE's heavily-reused vreg names)
-Gating is computed per basic block over instruction windows, NOT via
-function-wide def/use counts (which reject reused names outright):
-- %M2's only reader in [def, next-redef) is the consumer add  -> safe to
-  rebase the consumer and drop %M2's def.
-- %F's only reader in its window is one global ld/st MemOp base  -> safe to
-  fold the constant offset into exactly that memory op.
-- k != 0: %A's only reader in its window is the outer shift  -> the leading
-  add is dead after rewrite.  (%M1 may be shared across limbs; preserved.)
-- k == 0: %M1 (= %A) may be shared; we never delete it, only add %Mn.
-- %X must not be rewritten between its source shift and the insertion point.
-- k<<S2 must fit the signed 24-bit LDG.E/STG.E offset; S1+S2 in [1,31].
+All gating is per basic block over instruction windows, NOT function-wide
+def/use counts (which reject reused names).  %M2's sole reader is the
+consumer add; %F's sole reader is one global ld/st base; for k!=0 %A's sole
+reader is the outer shift (its leading add is then dead); %M1 and %B must be
+unwritten between a group's anchor and each reuse (same value).  k<<S2 must
+fit the signed 24-bit LDG.E/STG.E offset; S2 in [1,4] (LEA scale range).
 
-Toggle: OFF unless OPENPTXAS_ENABLE_SHL_DISTRIBUTE is set (staged; gated so
-the default path is byte-identical until GPU-validated on linux via
-/tmp/driver.py — see project_openptxas.md).
+GPU-validated (2026-06-14): with OPENPTXAS_ENABLE_SHL_DISTRIBUTE alone,
+bit_reverse_qm31 is byte/behaviour-identical to ptxas on the 5090 at
+N=256 AND N=4096 (/tmp/driver.py).  Flag-off keeps the whole reference set
+byte-identical to the prior commit.
 
-FINDING 2026-06-13 — this is NOT the shape ptxas emits (do not chase
-byte-parity with it).  ptxas 13.3 does NOT combine the two shifts: for
-bit_reverse it keeps `R6 = revidx<<2` (IMAD.SHL + SHF.R.HI, so R6:R7 is
-non-zero-extended) and emits `LEA R4, R6, base, 0x2` + `LEA.HI.X R5, R6,
-base_hi, R7, 0x2` — i.e. a NON-HI-ZERO UR-base LEA on the *intermediate*
-shifted index (src_c = R7 = the index's high half).  This pass instead
-folds to `revidx<<(S1+S2)` (hi-zero), a valid but DIFFERENT cubin that
-won't byte-match.  It also barely fires on real FORGE kernels because the
-index vreg is typically clobbered before the address compute (the
-stability check correctly bails).  The real path to ptxas-13.3 parity is
-the non-hi-zero UR-base LEA selection (encode_lea_hi_x already supports
-src_c=idx.hi via ur_base=True) + constant-offset folding that replicates
-ptxas's per-site choices — NOT shift distribution.  Kept as a correct,
-gated, isolation-tested transform (useful for a future non-byte-exact
-instruction-reduction mode), not for parity.
+Toggle: OFF unless OPENPTXAS_ENABLE_SHL_DISTRIBUTE is set.  Pairs with the
+non-hi-zero LEA selection (OPENPTXAS_ENABLE_NONHZ_LEA) which consumes the
+%M1 index this pass exposes — but that LEA path is NOT yet correct (it
+reads idx.hi via ctx.ra.hi but the intermediate's high half is not
+materialised; crashes at N=4096).  This coalescing pass is correct on its
+own; the LEA emission is the open item.
 """
 from __future__ import annotations
 
@@ -125,6 +109,14 @@ def _next_write_after(instrs, idx, name) -> int:
     return len(instrs)
 
 
+def _writes_between(instrs, lo, hi, name) -> bool:
+    """True if any instruction in (lo, hi) writes `name`."""
+    for j in range(lo + 1, hi):
+        if _writes(instrs[j], name):
+            return True
+    return False
+
+
 def _reg_readers(instrs, lo, hi, name):
     """Positions in [lo,hi) reading `name` as a RegOp source."""
     out = []
@@ -167,6 +159,8 @@ def run_function(fn: Function) -> int:
     n = 0
     for bb in fn.blocks:
         instrs = bb.instructions
+        cse: dict = {}        # (M1, S2, B, pred) -> (shared_base_vreg, anchor_idx)
+        dead: set = set()     # id() of instructions to drop after the block walk
         i = 0
         while i < len(instrs):
             sh2 = _shl_of(instrs[i])             # outer shift: %M2 = %A << S2
@@ -214,8 +208,7 @@ def run_function(fn: Function) -> int:
                 i += 1
                 continue
 
-            S = S1 + S2
-            if S < 1 or S > 31:           # (1<<S) must stay u32 for the LEA scale chain
+            if S2 < 1 or S2 > 4:          # LEA encodes scale 0..4 (the OUTER shift)
                 i += 1
                 continue
 
@@ -263,17 +256,11 @@ def run_function(fn: Function) -> int:
                 i += 1
                 continue
 
-            # %X must be stable between its source shift and the insertion point i.
-            x_src_idx = m1_def_idx if not is_k0 else a_def_idx
-            if _last_write_before(instrs, i + 1, x_op.name) != \
-                    _last_write_before(instrs, x_src_idx + 1, x_op.name):
-                i += 1
-                continue
+            b_name = b_reg.name
 
-            # Offset = K << S2, folded into the memory operand.
+            # Offset to fold = k << S2, into the consuming memory operand.
             off = (K << S2) & 0xFFFFFFFFFFFFFFFF
             soff = off - (1 << 64) if off >= (1 << 63) else off
-            # Locate the target memop and its existing offset.
             tgt = None
             for si, s in enumerate(ldst.srcs or []):
                 if isinstance(s, MemOp) and isinstance(s.base, str):
@@ -290,16 +277,44 @@ def run_function(fn: Function) -> int:
                 i += 1
                 continue
 
-            # --- Rewrite -----------------------------------------------------
-            mn = _alloc_vreg(fn)
-            new_shl = Instruction(op="shl", types=["b64"], dest=RegOp(mn),
-                                  srcs=[RegOp(x_op.name), ImmOp(S)],
-                                  pred=instrs[i].pred, neg=instrs[i].neg)
-            instrs[i] = new_shl                       # replace outer shift in place
-            cadd.srcs = [RegOp(b_reg.name), RegOp(mn)]  # %F = %B + %Mn
-            ldst.srcs[si] = MemOp(base=memop.base, offset=new_off)
+            # Match ptxas: the LEA index is the INTERMEDIATE %M1 = X<<S1 (kept,
+            # non-zero-extended), the scale is the OUTER shift S2, and limbs
+            # sharing (M1, S2, B) collapse to ONE shared base  B + M1<<S2  +
+            # folded per-limb offsets.  Use a fresh base vreg so the shared
+            # address is never clobbered by FORGE's vreg reuse.
+            key = (m1_name, S2, b_name, pred)
+            cached = cse.get(key)
+            if cached is not None:
+                fsh, anchor_i = cached
+                # M1 and B must hold the SAME value at anchor and here.
+                if (_writes_between(instrs, anchor_i, i, m1_name)
+                        or _writes_between(instrs, anchor_i, i, b_name)):
+                    i += 1
+                    continue
+                # Reuse the shared base; drop this limb's whole address chain.
+                ldst.srcs[si] = MemOp(base=fsh, offset=new_off)
+                dead.add(id(instrs[i]))            # outer shl
+                dead.add(id(cadd))                 # consumer add
+                if not is_k0:
+                    dead.add(id(a_def))            # leading add
+            else:
+                # Anchor: emit  shl %Mn,%M1,S2 ; add %Fsh,%B,%Mn  (fresh vregs),
+                # fold this limb's own offset into its memop.
+                mn = _alloc_vreg(fn)
+                fsh = _alloc_vreg(fn)
+                instrs[i] = Instruction(op="shl", types=["b64"], dest=RegOp(mn),
+                                        srcs=[RegOp(m1_name), ImmOp(S2)],
+                                        pred=instrs[i].pred, neg=instrs[i].neg)
+                cadd.dest = RegOp(fsh)
+                cadd.srcs = [RegOp(b_name), RegOp(mn)]
+                ldst.srcs[si] = MemOp(base=fsh, offset=new_off)
+                if not is_k0:
+                    dead.add(id(a_def))            # leading add now dead
+                cse[key] = (fsh, i)
             n += 1
             i += 1
+        if dead:
+            bb.instructions = [x for x in instrs if id(x) not in dead]
     return n
 
 

@@ -845,18 +845,21 @@ def analyze_imad_wide_fuse(fn) -> dict:
                 continue
             mul_dest = inst.dest.name
             _hi_zero = _idx_hi_zero(idx_op.name)
-            # CONSERVATIVE GATE (see project_openptxas.md 2026-06-12): the
-            # non-hi-zero LEA case is blocked on an offset-through-shift
-            # distribution pass.  ptxas computes ONE base address + folded
-            # constant limb offsets where the FORGE PTX has N per-limb
-            # `(idx+c)<<s` computations; without distributing `c<<s` out as a
-            # foldable offset, fusing the per-limb adds overshoots ptxas
-            # (bit_reverse 4->16, gather 8->16) — proven by before/after diff.
-            # The "final effective-address only" constraint (global_base_vregs)
-            # is necessary but NOT sufficient (after5 experiment).  Keep the
-            # hi-zero-only gate until the distribution pass exists.
+            # Non-hi-zero LEA matches ptxas's two-level structure: a UR-base LEA
+            # on the INTERMEDIATE shifted index (idx = X<<S1, non-zero-extended),
+            # scale = the outer shift, src_c = idx.hi.  It is enabled together
+            # with the shl_distribute pass, which first collapses FORGE's
+            # per-limb `(idx+c)<<s` chains to ONE shared base + folded offsets;
+            # without that collapse, fusing the per-limb adds overshoots ptxas
+            # (bit_reverse 4->16).  Both ride OPENPTXAS_ENABLE_SHL_DISTRIBUTE, so
+            # the default path stays hi-zero-only.  The final-address constraint
+            # (global_base_vregs, below) narrows non-hi-zero to real addresses.
+            import os as _os
+            _nonhz_ok = bool(_os.environ.get("OPENPTXAS_ENABLE_NONHZ_LEA"))
             if not _hi_zero:
-                continue
+                if not (_nonhz_ok and K > 0 and (K & (K - 1)) == 0
+                        and (K.bit_length() - 1) <= 4):
+                    continue
             # Local live-range walk replaces the global def_count/use_count
             # checks (which were too conservative for non-SSA PTX such as
             # FORGE-emitted wrappers, where vreg names are heavily reused).
@@ -971,6 +974,14 @@ def _emit_imad_wide_fused(instr, ctx, output, op_label: str = 'fused') -> bool:
     if _base_is_ur and 0 <= _scale <= 4:
         _ur_base = _ur[_base_name]
         _final_hi = _final_lo + 1
+        # KNOWN BUG (non-hi-zero path, OPENPTXAS_ENABLE_NONHZ_LEA): ctx.ra.hi
+        # gives the index's high GPR, but for an intermediate idx = X<<S1 the
+        # high half is often NOT materialised (the hi-zero fusion only ever
+        # needed the low 32 bits), so src_c reads a stale register -> wrong
+        # address -> GPU crash at large N (bit_reverse N=4096).  ptxas computes
+        # both halves explicitly (IMAD.SHL + SHF.R.U32.HI) before the LEA.  FIX:
+        # ensure _idx_name's hi GPR is materialised here (emit the SHF.R.U32.HI
+        # if absent) before using it as src_c.  Until then NONHZ_LEA is off.
         _src_c = RZ if _idx_hi_zero else ctx.ra.hi(_idx_name)
         _src_c_txt = 'RZ' if _idx_hi_zero else f'R{_src_c}'
         output.append(SassInstr(
