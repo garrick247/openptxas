@@ -4746,8 +4746,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     d_lo = ctx.ra.lo(instr.dest.name)
                     a_lo = _ensure_u64_gpr(instr.srcs[0])
                     b_lo = _ensure_u64_gpr(instr.srcs[1])
-                    output.append(SassInstr(encode_imad_wide_rr(d_lo, a_lo, b_lo, RZ),
-                        f'IMAD.WIDE R{d_lo}, R{a_lo}, R{b_lo}, RZ  // mul.lo.{typ} wide'))
+                    # mul.lo (low 64 bits) is sign-agnostic, but the partial
+                    # products MUST be unsigned: a signed IMAD.WIDE sign-extends
+                    # a limb whose bit 31 is set, corrupting the high 32 bits of
+                    # the product.  ptxas uses IMAD.WIDE.U32 here.  (Bug found by
+                    # the multi-entry GPU harness on m31_scale: val*scale with
+                    # high-bit operands gave wrong results.)
+                    output.append(SassInstr(encode_imad_wide_u32(d_lo, a_lo, b_lo, RZ),
+                        f'IMAD.WIDE.U32 R{d_lo}, R{a_lo}, R{b_lo}, RZ  // mul.lo.{typ} wide'))
                     # IMAD R-R (0x2a4) is broken on SM_120. Use IMAD.WIDE for cross terms:
                     # cross1 = a_lo * b_hi; cross2 = a_hi * b_lo; d_hi += cross1 + cross2
                     # Skip any cross term whose multiplier register is known to be zero.
@@ -4760,14 +4766,14 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         t = _alloc_gpr_pair(ctx)
                     if need_cross1:
                         # cross1: t = a_lo * b_hi (low 32 of wide product)
-                        output.append(SassInstr(encode_imad_wide_rr(t, a_lo, b_hi, RZ),
-                            f'IMAD.WIDE R{t}, R{a_lo}, R{b_hi}, RZ  // cross a_lo*b_hi'))
+                        output.append(SassInstr(encode_imad_wide_u32(t, a_lo, b_hi, RZ),
+                            f'IMAD.WIDE.U32 R{t}, R{a_lo}, R{b_hi}, RZ  // cross a_lo*b_hi'))
                         output.append(SassInstr(encode_iadd3(d_lo+1, d_lo+1, t, RZ),
                             f'IADD3 R{d_lo+1}, R{d_lo+1}, R{t}, RZ  // d_hi += cross1'))
                     if need_cross2:
                         # cross2: t = a_hi * b_lo (low 32 of wide product)
-                        output.append(SassInstr(encode_imad_wide_rr(t, a_hi, b_lo, RZ),
-                            f'IMAD.WIDE R{t}, R{a_hi}, R{b_lo}, RZ  // cross a_hi*b_lo'))
+                        output.append(SassInstr(encode_imad_wide_u32(t, a_hi, b_lo, RZ),
+                            f'IMAD.WIDE.U32 R{t}, R{a_hi}, R{b_lo}, RZ  // cross a_hi*b_lo'))
                         output.append(SassInstr(encode_iadd3(d_lo+1, d_lo+1, t, RZ),
                             f'IADD3 R{d_lo+1}, R{d_lo+1}, R{t}, RZ  // d_hi += cross2'))
                     if need_cross1 or need_cross2:
