@@ -1658,6 +1658,9 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
         0x3e: 0x03,   # ALU → rbar=0x03
     }
 
+    import os as _os
+    _conservative_sb = bool(_os.environ.get("OPENPTXAS_CONSERVATIVE_SB"))
+
     misc_counter = 0
     _ldcu_slot_counter[0] = 0  # reset per kernel
     _ldc_slot_counter[0] = 0   # reset per kernel
@@ -1942,6 +1945,25 @@ def assign_ctrl(instrs: list[SassInstr]) -> list[SassInstr]:
                         break
             if vote_nearby:
                 misc = misc_counter & 0xF  # use counter, not override
+
+        # DIAGNOSTIC (OPENPTXAS_CONSERVATIVE_SB): force this instruction to wait
+        # on EVERY currently-pending long-latency write (regs, URs, preds), not
+        # only those the source-register analysis matched.  Purely additive to
+        # rbar (more waits, never fewer) — it cannot under-synchronize.  If a
+        # non-deterministic kernel goes deterministic under this flag, the normal
+        # scoreboard is MISSING a dependency (a true RAW the src-reg analysis
+        # didn't see) => a real scoreboard under-sync bug.
+        if _conservative_sb:
+            for _r, (_s, _pw) in pending_writes.items():
+                _c = 0x09 if _pw == 0x35 else _WDEP_TO_RBAR.get(_pw, 0x01)
+                rbar |= _c
+            for _ur, (_s, _pw) in pending_ur_writes.items():
+                if _pw in _WDEP_TO_RBAR:
+                    rbar |= _WDEP_TO_RBAR[_pw]
+            for _p, (_s, _pw) in pending_pred_writes.items():
+                if _pw in _WDEP_TO_RBAR:
+                    rbar |= _WDEP_TO_RBAR[_pw]
+
         ctrl = (stall << 17) | (rbar << 10) | (wdep << 4) | misc
         misc_counter += 1
 
