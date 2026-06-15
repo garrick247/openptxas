@@ -33,11 +33,15 @@ N=256 AND N=4096 (/tmp/driver.py).  Flag-off keeps the whole reference set
 byte-identical to the prior commit.
 
 Toggle: OFF unless OPENPTXAS_ENABLE_SHL_DISTRIBUTE is set.  Pairs with the
-non-hi-zero LEA selection (OPENPTXAS_ENABLE_NONHZ_LEA) which consumes the
-%M1 index this pass exposes — but that LEA path is NOT yet correct (it
-reads idx.hi via ctx.ra.hi but the intermediate's high half is not
-materialised; crashes at N=4096).  This coalescing pass is correct on its
-own; the LEA emission is the open item.
+non-hi-zero LEA selection (OPENPTXAS_ENABLE_NONHZ_LEA), which consumes the
+%M1 index this pass exposes and materialises idx.hi = X>>(32-S1) via
+SHF.R.U32.HI at the emit site (matching ptxas).  With BOTH flags,
+bit_reverse_qm31 is GPU-MATCH at N=256 AND N=4096 and emits LEA=4 (== ptxas)
+— validated 2026-06-14 on the 5090.  Still gated by default: the other
+FORGE kernels are multi-entry modules that the /tmp/driver.py harness can't
+launch (symbol-selection artifact), so they are not yet GPU-validated, and
+their LEA counts currently undershoot ptxas (collapse more aggressively).
+Enabling by default awaits a multi-entry-capable harness.
 """
 from __future__ import annotations
 

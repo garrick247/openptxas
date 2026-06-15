@@ -715,7 +715,7 @@ def analyze_imad_wide_fuse(fn) -> dict:
     (IADD3-imm-lo + IADD3-imm-hi + IMAD.WIDE-RR + IADD.64-R-UR) with
     1 instruction (or 1+2 MOVs when the base is UR-only).
     """
-    from ptx.ir import RegOp, ImmOp, MemOp
+    from ptx.ir import RegOp, ImmOp, MemOp, VectorRegOp
 
     all_instrs = []
     for bb in fn.blocks:
@@ -795,7 +795,8 @@ def analyze_imad_wide_fuse(fn) -> dict:
             return (df.srcs[0].value & 0xFFFFFFFFFFFFFFFF, id(df))
         return None
 
-    fuse_map: dict[int, tuple[str, int, str, str, int, int | None, bool]] = {}
+    fuse_map: dict[int, tuple[str, int, str, str, int, int | None, bool,
+                              tuple[str, int] | None]] = {}
     # Walk pairs of (mul, add) within the same BB.  The add must be the
     # *first* use of the mul dest; if any earlier instr (including the
     # mul itself) uses %M, that's surprising — bail.  We iterate over BB
@@ -929,8 +930,25 @@ def analyze_imad_wide_fuse(fn) -> dict:
             # reused-vreg FORGE kernels (LEA dest != the reg the load reads).
             if not _hi_zero and add_inst.dest.name not in global_base_vregs:
                 continue
+            # Non-hi-zero: the LEA.HI.X needs idx.hi = X >> (32-S1) where the
+            # index idx = X<<S1.  Record (X, S1) from idx's defining shift so
+            # the emitter can materialise it (SHF.R.U32.HI), matching ptxas.
+            # If idx isn't a `shl reg, imm`, we can't compute its hi -> skip.
+            _inner = None
+            if not _hi_zero:
+                _idf = def_instr.get(idx_op.name)
+                if (_idf is not None and _idf.op == 'shl'
+                        and any(t in ('b64', 'u64', 's64') for t in (_idf.types or ()))
+                        and len(_idf.srcs or []) == 2
+                        and isinstance(_idf.srcs[0], RegOp)
+                        and not isinstance(_idf.srcs[0], VectorRegOp)
+                        and isinstance(_idf.srcs[1], ImmOp)
+                        and 0 < _idf.srcs[1].value < 32):
+                    _inner = (_idf.srcs[0].name, _idf.srcs[1].value)
+                if _inner is None:
+                    continue
             fuse_map[id(inst)] = (idx_op.name, K, base, add_inst.dest.name,
-                                  id(add_inst), dead_mov_id, _hi_zero)
+                                  id(add_inst), dead_mov_id, _hi_zero, _inner)
 
     return fuse_map
 
@@ -953,7 +971,7 @@ def _emit_imad_wide_fused(instr, ctx, output, op_label: str = 'fused') -> bool:
     if id(instr) not in _fuse_map:
         return False
     (_idx_name, _K, _base_name, _fused_dest_name,
-     _add_id, _dead_mov_id, _idx_hi_zero) = _fuse_map[id(instr)]
+     _add_id, _dead_mov_id, _idx_hi_zero, _inner_shift) = _fuse_map[id(instr)]
     _idx_lo = ctx.ra.lo(_idx_name)
     _final_lo = ctx.ra.lo(_fused_dest_name)
     _gw = getattr(ctx, '_gpr_written', set())
@@ -974,16 +992,25 @@ def _emit_imad_wide_fused(instr, ctx, output, op_label: str = 'fused') -> bool:
     if _base_is_ur and 0 <= _scale <= 4:
         _ur_base = _ur[_base_name]
         _final_hi = _final_lo + 1
-        # KNOWN BUG (non-hi-zero path, OPENPTXAS_ENABLE_NONHZ_LEA): ctx.ra.hi
-        # gives the index's high GPR, but for an intermediate idx = X<<S1 the
-        # high half is often NOT materialised (the hi-zero fusion only ever
-        # needed the low 32 bits), so src_c reads a stale register -> wrong
-        # address -> GPU crash at large N (bit_reverse N=4096).  ptxas computes
-        # both halves explicitly (IMAD.SHL + SHF.R.U32.HI) before the LEA.  FIX:
-        # ensure _idx_name's hi GPR is materialised here (emit the SHF.R.U32.HI
-        # if absent) before using it as src_c.  Until then NONHZ_LEA is off.
-        _src_c = RZ if _idx_hi_zero else ctx.ra.hi(_idx_name)
-        _src_c_txt = 'RZ' if _idx_hi_zero else f'R{_src_c}'
+        # LEA.HI.X src_c carries the index's high half.  Hi-zero index -> RZ.
+        # Non-hi-zero index = X<<S1: its high half is X >> (32-S1), and is NOT
+        # otherwise materialised (the hi-zero fusion only needed the low 32
+        # bits), so we compute it here with SHF.R.U32.HI(RZ, 32-S1, X) into a
+        # fresh GPR — exactly as ptxas does (IMAD.SHL + SHF.R.U32.HI before the
+        # LEA).  Requires X to still be allocated; otherwise don't fuse.
+        if _idx_hi_zero:
+            _src_c = RZ
+            _src_c_txt = 'RZ'
+        else:
+            _x_name, _s1 = _inner_shift
+            if _x_name not in ctx.ra.int_regs:
+                return False
+            _src_c = _alloc_gpr(ctx)
+            output.append(SassInstr(
+                encode_shf_r_u32_hi(_src_c, RZ, 32 - _s1, ctx.ra.lo(_x_name)),
+                f'SHF.R.U32.HI R{_src_c}, RZ, {32 - _s1}, R{ctx.ra.lo(_x_name)}'
+                f'  // {op_label}: materialize idx.hi (X>>{32 - _s1}) for LEA.HI.X'))
+            _src_c_txt = f'R{_src_c}'
         output.append(SassInstr(
             encode_lea(_final_lo, _ur_base, _idx_lo, _scale),
             f'LEA R{_final_lo}, P0, R{_idx_lo}, UR{_ur_base}, 0x{_scale:x}'
