@@ -1009,6 +1009,7 @@ OPCODE_DISPATCH = {
     "ISETP.GT.U32.AND": _op_ISETP_GT_U32_AND,
     "ISETP.EQ.U32.AND": _op_ISETP_EQ_U32_AND,
     "SHF.L.U64.HI": _op_SHF_L_U64_HI,
+    "SHF.L.U32.HI": _op_SHF_L_U64_HI,  # same funnel (merkle hash rotates, shift<32)
     "SHF.R.U32.HI": _op_SHF_R_U32_HI,
     "SHF.R.U64": _op_SHF_R_U64,
     "LOP3.LUT": _op_LOP3_LUT,
