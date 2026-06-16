@@ -1611,7 +1611,7 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
             else:
                 imm_lo = b.value & 0xFFFFFFFF
                 return prefix + _emit_ur_to_gpr(d_lo, ur_tmp, 'deferred UR->GPR') + [
-                    SassInstr(encode_iadd3_imm32(d_lo, d_lo, imm_lo, RZ),
+                    SassInstr(encode_iadd3_imm32(d_lo, d_lo, imm_lo, RZ, write_carry=True),
                               f'IADD3.IMM R{d_lo}, R{d_lo}, {imm_lo:#x}, RZ  // add.u64 lo imm'),
                     SassInstr(encode_iadd3x(d_lo + 1, d_lo + 1, RZ, RZ),
                               f'IADD3.X R{d_lo+1}, R{d_lo+1}, RZ, RZ  // add.u64 hi carry'),
@@ -1638,7 +1638,7 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
                 # Materialize UR→GPR, then add immediate
                 imm_lo = b.value & 0xFFFFFFFF
                 return _emit_ur_to_gpr(d_lo, ur_idx, 'materialize UR->GPR') + [
-                    SassInstr(encode_iadd3_imm32(d_lo, d_lo, imm_lo, RZ),
+                    SassInstr(encode_iadd3_imm32(d_lo, d_lo, imm_lo, RZ, write_carry=True),
                               f'IADD3.IMM R{d_lo}, R{d_lo}, {imm_lo:#x}, RZ  // add.u64 lo imm'),
                     SassInstr(encode_iadd3x(d_lo + 1, d_lo + 1, RZ, RZ),
                               f'IADD3.X R{d_lo+1}, R{d_lo+1}, RZ, RZ  // add.u64 hi carry'),
@@ -1650,7 +1650,7 @@ def _select_add_u64(instr: Instruction, ra: RegAlloc,
             ctx._gpr_written.add(dest.name)
         # IADD3.IMM lo + IADD3.X hi (carry propagates via hardcoded predicate bits)
         return [
-            SassInstr(encode_iadd3_imm32(d_lo, a_lo, imm_lo, RZ),
+            SassInstr(encode_iadd3_imm32(d_lo, a_lo, imm_lo, RZ, write_carry=True),
                       f'IADD3.IMM R{d_lo}, R{a_lo}, {imm_lo:#x}, RZ  // add.u64 lo imm'),
             SassInstr(encode_iadd3x(d_lo + 1, a_lo + 1, RZ, RZ),
                       f'IADD3.X R{d_lo+1}, R{a_lo+1}, RZ, RZ  // add.u64 hi carry'),

@@ -3952,11 +3952,19 @@ def encode_mov32i(dest: int, imm32: int, ctrl: int = 0) -> bytes:
 # Modifier bytes for imm form:      b9=0xe0, b10=0xff, b11=0x07 (same)
 
 def encode_iadd3_imm32(dest: int, src0: int, imm32: int, src2: int,
-                       ctrl: int = 0) -> bytes:
+                       ctrl: int = 0, write_carry: bool = False) -> bytes:
     """Encode IADD3 dest, src0, imm32, src2 with 32-bit immediate.
 
     Ground truth: IADD3 R2, R0, 0xffffffe, RZ
       bytes: 10 78 02 00 fe ff ff 0f | ff e0 ff 07 00 c8 1f 00
+
+    When write_carry=True the carry-out is written to P0 (b10=0xf1, same as
+    encode_iadd3's ADD path) so a paired IADD3.X (which reads carry-in from P0)
+    gets a REAL carry.  Without it (b10=0xff -> PT) the low add of a 64-bit
+    `add.u64 reg, imm` discards its carry and the high IADD3.X reads a STALE
+    P0 -> the high word is wrong whenever P0 happened to be set, which on
+    hardware is timing-dependent => non-determinism (root cause of the
+    merkle_hash miscompile, found 2026-06-15 via the SASS emulator).
     """
     if ctrl == 0: ctrl = _CTRL_DEFAULT
     b13, b14, b15 = _ctrl_to_bytes(ctrl)
@@ -3971,7 +3979,7 @@ def encode_iadd3_imm32(dest: int, src0: int, imm32: int, src2: int,
     raw[7] = (imm32 >> 24) & 0xFF
     raw[8]  = src2 & 0xFF
     raw[9]  = 0xe0
-    raw[10] = 0xff
+    raw[10] = 0xf1 if write_carry else 0xff   # 0xf1 = carry-out -> P0
     raw[11] = 0x07
     raw[13], raw[14], raw[15] = b13, b14, b15
     return bytes(raw)
