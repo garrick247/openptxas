@@ -24,6 +24,8 @@ from enum import Enum
 
 from sass.isel import SassInstr
 from sass.encoding.sm_120_opcodes import encode_nop as _encode_nop
+import os as _ls_os
+from sass.list_scheduler import schedule_and_rename
 
 
 # ---------------------------------------------------------------------------
@@ -720,8 +722,6 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
                 # (0x210, 0x819) entry alone collapses 627 NOPs (318 in
                 # :single + 309 in :quad) introduced by Phase 11.
                 (0x210, 0x819),  # IADD3.RRR     -> SHF.L.U32.HI (merkle hot)
-                (0x212, 0x819),  # LOP3.LUT R-R-R -> SHF.L.U32.HI
-                (0x210, 0x212),  # IADD3.RRR     -> LOP3.LUT R-R-R
                 (0x819, 0x212),  # SHF.L.U32.HI  -> LOP3.LUT R-R-R (prod-only PASS)
                 # Phase 13: LOP3 -> MOV pair, sibling to (0x212, 0x210) /
                 # (0x812, 0x210) above.  isel.py's lop3-fixup pattern (LOP3
@@ -753,7 +753,6 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
                 # on the consumer's wdep=0x3e slot (identical mechanism to
                 # the existing (0x212,0x212) LOP3-LOP3 self-chain added in
                 # Phase 32 + (0x210,0x819) IADD3->SHF added in Phase 12).
-                (0x819, 0x210),  # SHF.IMM -> IADD3.RRR (mirror of Phase 12 (0x210,0x819))
                 (0x210, 0x210),  # IADD3.RRR self-chain (Phase 34 fusion target)
                 # Phase 41: isel.py commutes IMM-LHS xor/and/or to RHS so the
                 # IMAD-FUSE-1 LOP3.IMM (0x812) encoding fires for merkle's
@@ -763,7 +762,6 @@ def _enforce_gpr_latency(instrs: list[SassInstr]) -> list[SassInstr]:
                 # 0x812 are LOP3 forms going through FXU/COUPLED_MATH, so the
                 # 6-cycle FXU->FXU RAW is enforced by the same soft-scoreboard
                 # mechanism as (0x212,0x819) Phase 12 and (0x212,0x212) Phase 32.
-                (0x812, 0x819),  # LOP3.IMM -> SHF.L.U32.HI (mirror of (0x212,0x819))
                 (0x812, 0x212),  # LOP3.IMM -> LOP3.LUT R-R-R (mirror of (0x212,0x212))
             }
             if (opc_i, opc_j) in _SCHED_FORWARDING_SAFE:
@@ -1691,5 +1689,11 @@ def schedule(instrs: list[SassInstr]) -> list[SassInstr]:
     # instrs = _remove_forwarding_safe_nops(instrs)
     # Skip LDG latency NOPs — rely on ctrl wdep for LDG (ptxas pattern)
     # instrs = _reorder_after_ldg(instrs)
+
+    # OPENPTXAS_LIST_SCHED: latency-aware list scheduler + register
+    # renaming over pure-ALU runs (fixes the SM_120 FXU->FXU RAW
+    # hazard that NOP padding cannot cover).  Gated; off = no change.
+    if not _ls_os.environ.get("OPENPTXAS_NO_LIST_SCHED"):  # default-ON; opt-out env
+        instrs = schedule_and_rename(instrs, 0)
 
     return instrs
