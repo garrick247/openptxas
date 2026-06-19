@@ -619,11 +619,17 @@ def _get_src_regs(raw: bytes) -> set[int]:
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255 and opcode == 0x223: regs.add(raw[8])
-        elif opcode in (0x825, 0x225):  # IMAD.WIDE (R-imm 0x825, R-R 0x225): src2 is 64-bit pair
+        elif opcode == 0x825:  # IMAD.WIDE.U32 R-imm: src0=b3, b4..b7=imm (NOT a reg), src2=b8 pair
+            if raw[3] < 255: regs.add(raw[3])
+            if raw[8] < 255: regs |= {raw[8], raw[8]+1}
+        elif opcode == 0x225:  # IMAD.WIDE.U32 R-R: src0=b3, src1=b4, src2=b8 pair
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs |= {raw[8], raw[8]+1}
-        elif opcode in (0x824, 0x224, 0x2a4):  # IMAD non-wide variants: src0=b3, src1=b4, src2=b8
+        elif opcode == 0x824:  # IMAD.SHL.U32 R-imm: src0=b3, b4..b7=imm (NOT a reg), src2=b8
+            if raw[3] < 255: regs.add(raw[3])
+            if raw[8] < 255: regs.add(raw[8])
+        elif opcode in (0x224, 0x2a4):  # IMAD R-R: src0=b3, src1=b4, src2=b8
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs.add(raw[8])
