@@ -153,6 +153,41 @@ def compute_liveness(instrs, cfg):
     return live_in, live_out
 
 
+# Region = maximal single-entry straight-line span schedulable as a unit. It
+# SPANS memory/UR fences (LDG/STG/ATOM/S2R) -- so independent ALU can be moved
+# across them to fill FXU-latency gaps in serial chains -- but BREAKS at control
+# flow, sync/barriers, cross-lane ops, and merge points (>1 predecessor), where
+# free reordering would be unsound.
+_REGION_BREAK = (
+    {0x947, 0x94d, 0xb1d, 0x941, 0x992, 0x91a, 0x9af}  # BRA/EXIT/BAR/BSYNC/MEMBAR/DEPBAR
+    | {0x589, 0xf89, 0x989, 0x806}                      # SHFL/VOTE (cross-lane)
+)
+
+
+def build_regions(instrs, cfg):
+    """Return [(start, end)] schedulable regions: maximal single-entry straight-line
+    spans. A new region starts at index 0, right after a control/cross-lane op, or
+    at a CFG merge point (block with >1 predecessor). Memory/UR fences do NOT split
+    a region (the scheduler treats them as ordered anchors and schedules ALU around
+    them)."""
+    n = len(instrs)
+    if n == 0:
+        return []
+    blk_of = cfg["blk_of"]
+    pred = cfg["pred"]
+    block_start = {s for (s, e) in cfg["blocks"]}
+    leader = [False] * n
+    leader[0] = True
+    for i in range(1, n):
+        if _get_opcode(instrs[i - 1].raw) in _REGION_BREAK:
+            leader[i] = True
+        elif i in block_start and len(pred[blk_of[i]]) > 1:
+            leader[i] = True  # merge point: can't schedule across a join
+    starts = [i for i in range(n) if leader[i]]
+    return [(starts[k], starts[k + 1] if k + 1 < len(starts) else n)
+            for k in range(len(starts))]
+
+
 def live_after_index(instrs, cfg, live_out, idx):
     """GPRs live immediately AFTER instruction `idx` (true CFG liveness, incl.
     back-edges). Recompute backward from the block's live_out to `idx`."""
