@@ -2510,7 +2510,12 @@ def compile_function(fn: Function, verbose: bool = False,
                     total = (rel_offset // 16) * 4
                     b2  = total & 0xFF
                     b4  = ((total >> 8) << 2) & 0xFF
-                    se  = 0xFF if b4 >= 0x80 else 0x00
+                    # Sign-extension must reflect the TRUE sign of the branch
+                    # displacement, not b4 high bit: a large POSITIVE offset
+                    # whose total bit13 is set makes b4>=0x80 and was wrongly
+                    # sign-extended to a huge negative target (out-of-bounds
+                    # BRA -> illegal instruction).  Use rel_offset actual sign.
+                    se  = 0xFF if rel_offset < 0 else 0x00
                     b10 = 0x80 | ((total >> 16) & 0x03)
                     old_raw[2]  = b2
                     old_raw[3]  = 0x00
