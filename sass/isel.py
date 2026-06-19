@@ -7171,8 +7171,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     output.append(SassInstr(encode_imad(t3, t3, abs_b, RZ),
                         f'IMAD R{t3}, R{t3}, R{abs_b}, RZ'))
                     # ab_s = |a| (saved), use as dividend for NR
-                    output.append(SassInstr(encode_imad_hi(t2, t2, t3, t1),
-                        f'IMAD.HI.U32 R{t2}, R{t2}, R{t3}, R{t1}'))
+                    output.append(SassInstr(encode_imad_hi(t2, t2, t3, RZ),
+                        f'IMAD.HI.U32 R{t2}, R{t2}, R{t3}, RZ'  # addend was HFMA2-zeroed; RZ avoids odd-srcC illegal-instr (sm_120 IMAD.HI srcC must be even)
+                        ))
                     output.append(SassInstr(encode_imad_hi(t2, t2, ab_s, RZ),
                         f'IMAD.HI.U32 R{t2}, R{t2}, R{ab_s}, RZ  // quotient approx'))
                     output.append(SassInstr(encode_iadd3_neg_b3(t3, t2, RZ, RZ),
@@ -7243,8 +7244,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         f'IADD3 R{t3}, RZ, -R{t2}, RZ'))
                     output.append(SassInstr(encode_imad(t3, t3, b, RZ),
                         f'IMAD R{t3}, R{t3}, R{b}, RZ'))
-                    output.append(SassInstr(encode_imad_hi(t2, t2, t3, t1),
-                        f'IMAD.HI.U32 R{t2}, R{t2}, R{t3}, R{t1}'))
+                    output.append(SassInstr(encode_imad_hi(t2, t2, t3, RZ),
+                        f'IMAD.HI.U32 R{t2}, R{t2}, R{t3}, RZ'  # addend was HFMA2-zeroed; RZ avoids odd-srcC illegal-instr (sm_120 IMAD.HI srcC must be even)
+                        ))
                     output.append(SassInstr(encode_imad_hi(t2, t2, a, RZ),
                         f'IMAD.HI.U32 R{t2}, R{t2}, R{a}, RZ  // quotient approx in t2'))
                     # Compute remainder: negate quotient in-place, then IMAD
@@ -7301,8 +7303,9 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         f'IADD3 R{t3}, RZ, -R{t2}, RZ'))
                     output.append(SassInstr(encode_imad(t3, t3, abs_b, RZ),
                         f'IMAD R{t3}, R{t3}, R{abs_b}, RZ'))
-                    output.append(SassInstr(encode_imad_hi(t2, t2, t3, t1),
-                        f'IMAD.HI.U32 R{t2}, R{t2}, R{t3}, R{t1}'))
+                    output.append(SassInstr(encode_imad_hi(t2, t2, t3, RZ),
+                        f'IMAD.HI.U32 R{t2}, R{t2}, R{t3}, RZ'  # addend was HFMA2-zeroed; RZ avoids odd-srcC illegal-instr (sm_120 IMAD.HI srcC must be even)
+                        ))
                     output.append(SassInstr(encode_imad_hi(t2, t2, abs_a, RZ),
                         f'IMAD.HI.U32 R{t2}, R{t2}, R{abs_a}, RZ  // quotient approx'))
                     output.append(SassInstr(encode_iadd3_neg_b3(t2, t2, RZ, RZ),
