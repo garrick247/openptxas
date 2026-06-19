@@ -7356,6 +7356,99 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             return r
                         raise ISelError(f"{op}.u64: unexpected operand type {op_node!r}")
 
+                    # ---- Mersenne fast path: rem.u64 by P = 2^k-1 (u32 const) ----
+                    if want_rem:
+                        if not hasattr(ctx, "_u64_defmap"):
+                            _dm = {}
+                            for _bb in fn.blocks:
+                                for _ii in _bb.instructions:
+                                    if isinstance(_ii.dest, RegOp):
+                                        _dm[_ii.dest.name] = _ii
+                            ctx._u64_defmap = _dm
+                        def _resolve_const_u32(_op):
+                            if isinstance(_op, ImmOp):
+                                _v = _op.value & 0xFFFFFFFFFFFFFFFF
+                                return _v if (_v >> 32) == 0 else None
+                            if isinstance(_op, RegOp):
+                                _df = ctx._u64_defmap.get(_op.name)
+                                if _df is None:
+                                    return None
+                                if (_df.op == "cvt" and _df.srcs
+                                        and isinstance(_df.srcs[0], RegOp)):
+                                    _t = _df.types or ()
+                                    if (any(x in ("u64", "b64") for x in _t[:1])
+                                            and any(x in ("u32", "b32") for x in _t[1:])):
+                                        _in = ctx._u64_defmap.get(_df.srcs[0].name)
+                                        if (_in is not None and _in.op == "mov"
+                                                and _in.srcs and isinstance(_in.srcs[0], ImmOp)):
+                                            return _in.srcs[0].value & 0xFFFFFFFF
+                                if (_df.op == "mov" and _df.srcs
+                                        and isinstance(_df.srcs[0], ImmOp)):
+                                    _v = _df.srcs[0].value & 0xFFFFFFFFFFFFFFFF
+                                    return _v if (_v >> 32) == 0 else None
+                            return None
+                        _P = _resolve_const_u32(instr.srcs[1])
+                        # only k=31 (M31) for now: 3-limb decomposition proven bit-exact
+                        if _P == 0x7fffffff:
+                            _k = 31
+                            _N = _materialize_u64(instr.srcs[0])
+                            _Nlo, _Nhi = _N, _N + 1
+                            _dlo = ctx.ra.lo(instr.dest.name)
+                            # Allocate temps FRESH above all live regs (incl. live
+                            # scratch like a store-address reg held across this op):
+                            # the reuse pool can hand back a still-live scratch reg.
+                            ctx._next_gpr = max(ctx._next_gpr, _Nlo + 2, _dlo + 2)
+                            def _fresh():
+                                _r = ctx._next_gpr
+                                ctx._next_gpr += 1
+                                ctx._scratch_highwater = max(ctx._scratch_highwater, ctx._next_gpr)
+                                return _r
+                            _l0 = _fresh()
+                            output.append(SassInstr(encode_lop3_imm32(_l0, _Nlo, _P, RZ, LOP3_IMM_AND),
+                                f"LOP3.AND R{_l0}, R{_Nlo}, 0x{_P:x}, RZ  // M31 rem: limb0 = N & P"))
+                            _sh = _fresh()
+                            output.append(SassInstr(encode_shf_r_u32(_sh, _Nlo, _k, _Nhi),
+                                f"SHF.R.U32 R{_sh}, R{_Nlo}, 0x{_k:x}, R{_Nhi}  // N>>k"))
+                            _l1 = _fresh()
+                            output.append(SassInstr(encode_lop3_imm32(_l1, _sh, _P, RZ, LOP3_IMM_AND),
+                                f"LOP3.AND R{_l1}, R{_sh}, 0x{_P:x}, RZ  // limb1 = (N>>k) & P"))
+                            _l2 = _fresh()
+                            output.append(SassInstr(encode_shf_r_u32(_l2, _Nhi, 2 * _k - 32, RZ),
+                                f"SHF.R.U32 R{_l2}, R{_Nhi}, 0x{2*_k-32:x}, RZ  // limb2 = N>>2k"))
+                            _s1 = _fresh()
+                            output.append(SassInstr(encode_iadd3(_s1, _l0, _l1, RZ),
+                                f"IADD3 R{_s1}, R{_l0}, R{_l1}, RZ  // l0+l1"))
+                            _s1lo = _fresh()
+                            output.append(SassInstr(encode_lop3_imm32(_s1lo, _s1, _P, RZ, LOP3_IMM_AND),
+                                f"LOP3.AND R{_s1lo}, R{_s1}, 0x{_P:x}, RZ"))
+                            _s1hi = _fresh()
+                            output.append(SassInstr(encode_shf_r_u32(_s1hi, _s1, _k, RZ),
+                                f"SHF.R.U32 R{_s1hi}, R{_s1}, 0x{_k:x}, RZ"))
+                            _s2 = _fresh()
+                            output.append(SassInstr(encode_iadd3(_s2, _s1lo, _s1hi, _l2),
+                                f"IADD3 R{_s2}, R{_s1lo}, R{_s1hi}, R{_l2}  // fold + limb2"))
+                            _s2lo = _fresh()
+                            output.append(SassInstr(encode_lop3_imm32(_s2lo, _s2, _P, RZ, LOP3_IMM_AND),
+                                f"LOP3.AND R{_s2lo}, R{_s2}, 0x{_P:x}, RZ"))
+                            _s2hi = _fresh()
+                            output.append(SassInstr(encode_shf_r_u32(_s2hi, _s2, _k, RZ),
+                                f"SHF.R.U32 R{_s2hi}, R{_s2}, 0x{_k:x}, RZ"))
+                            output.append(SassInstr(encode_iadd3(_dlo, _s2lo, _s2hi, RZ),
+                                f"IADD3 R{_dlo}, R{_s2lo}, R{_s2hi}, RZ  // s3 = fold"))
+                            _ps = ctx._next_pred
+                            _pge = ctx._next_pred; ctx._next_pred += 1
+                            _Pr = _fresh()
+                            output.append(SassInstr(encode_mov_imm(_Pr, _P),
+                                f"MOV R{_Pr}, 0x{_P:x}"))
+                            output.append(SassInstr(encode_isetp(_pge, _dlo, _Pr, ISETP_GE),
+                                f"ISETP.GE.U32 P{_pge}, PT, R{_dlo}, R{_Pr}, PT"))
+                            output.append(SassInstr(encode_iadd3_pred_neg_b4(_dlo, _dlo, _Pr, RZ, _pge),
+                                f"@P{_pge} IADD3 R{_dlo}, R{_dlo}, -R{_Pr}, RZ  // final reduce"))
+                            ctx._next_pred = _ps
+                            output.append(SassInstr(encode_mov_imm(_dlo + 1, 0),
+                                f"MOV R{_dlo+1}, RZ  // rem.u64 hi = 0"))
+                            continue
+
                     a_in = _materialize_u64(instr.srcs[0])
                     b_in = _materialize_u64(instr.srcs[1])
 
