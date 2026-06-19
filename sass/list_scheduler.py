@@ -141,7 +141,22 @@ def schedule_and_rename(instrs, body_start, L=_L_DEFAULT):
         if not _has_fxu_hazard(out[s:e], L):
             continue
         liveout = _liveout_after(out, e)
-        new = _sched_rename_run(out[s:e], liveout, L)
+        # regs touched anywhere OUTSIDE this run: CFG-sound superset of
+        # everything live across the run on any path (incl. back-edges).
+        reserved = set()
+        for _k in range(len(out)):
+            if s <= _k < e:
+                continue
+            _r = out[_k].raw
+            if _get_opcode(_r) == _NOP:
+                continue
+            for _x in _get_src_regs(_r):
+                if _x < 255:
+                    reserved.add(_x)
+            for _x in _get_dest_regs(_r):
+                if _x < 255:
+                    reserved.add(_x)
+        new = _sched_rename_run(out[s:e], liveout, L, reserved)
         out[s:e] = new
     return out
 
@@ -183,7 +198,7 @@ def _liveout_after(instrs, end):
     return live
 
 
-def _sched_rename_run(run, liveout, L):
+def _sched_rename_run(run, liveout, L, reserved=frozenset()):
     real = [si for si in run if _get_opcode(si.raw) != _NOP]
     n = len(real)
     if n < 2:
@@ -332,7 +347,8 @@ def _sched_rename_run(run, liveout, L):
 
     # ---- physical allocation (linear scan over scheduled order) ----
     pinned_regs = set(vphys_pin[v] for v in range(nv) if vphys_pin[v] is not None)
-    pool = [r for r in range(254, 1, -1) if r not in pinned_regs]
+    pool = [r for r in range(254, 1, -1)
+            if r not in pinned_regs and r not in reserved]
     phys = {}
     for v in range(nv):
         if vphys_pin[v] is not None: phys[v] = vphys_pin[v]
