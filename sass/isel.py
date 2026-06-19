@@ -1011,14 +1011,23 @@ def _emit_imad_wide_fused(instr, ctx, output, op_label: str = 'fused') -> bool:
                 f'SHF.R.U32.HI R{_src_c}, RZ, {32 - _s1}, R{ctx.ra.lo(_x_name)}'
                 f'  // {op_label}: materialize idx.hi (X>>{32 - _s1}) for LEA.HI.X'))
             _src_c_txt = f'R{_src_c}'
+        # LEA.HI.X reads the ORIGINAL index; if the LEA's low dest aliases the
+        # index reg, the LEA clobbers it first -> garbage high addr (illegal
+        # global access).  Preserve the index in a fresh GPR for LEA.HI.X.
+        _hi_idx = _idx_lo
+        if _final_lo == _idx_lo:
+            _hi_idx = _alloc_gpr(ctx)
+            output.append(SassInstr(
+                encode_mov(_hi_idx, _idx_lo),
+                f'MOV R{_hi_idx}, R{_idx_lo}  // {op_label}: preserve index (LEA dest aliases index)'))
         output.append(SassInstr(
             encode_lea(_final_lo, _ur_base, _idx_lo, _scale),
             f'LEA R{_final_lo}, P0, R{_idx_lo}, UR{_ur_base}, 0x{_scale:x}'
             f'  // {op_label}: UR-base addr lo'))
         output.append(SassInstr(
-            encode_lea_hi_x(_final_hi, _idx_lo, _ur_base + 1, _src_c,
+            encode_lea_hi_x(_final_hi, _hi_idx, _ur_base + 1, _src_c,
                             scale=_scale, p_in=0, ur_base=True),
-            f'LEA.HI.X R{_final_hi}, R{_idx_lo}, UR{_ur_base + 1}, {_src_c_txt}, '
+            f'LEA.HI.X R{_final_hi}, R{_hi_idx}, UR{_ur_base + 1}, {_src_c_txt}, '
             f'0x{_scale:x}, P0  // {op_label}: UR-base addr hi'))
         if hasattr(ctx, '_gpr_written'):
             ctx._gpr_written.add(_fused_dest_name)
