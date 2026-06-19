@@ -3905,8 +3905,11 @@ def compile_function(fn: Function, verbose: bool = False,
                     for s in inst.srcs if hasattr(s, 'base'))
             for bb in fn.blocks for inst in bb.instructions
             if hasattr(inst, 'op'))
+        # OPENPTXAS_NATIVE_CF: drop the >4-block complex-CF fallback gate so
+        # these kernels emit natively (if-conversion + deferred params handle CF).
+        _cf_fb = _has_complex_cf and not __import__('os').environ.get('OPENPTXAS_NATIVE_CF')
         _needs_full_fallback = (ctx._has_vote or _has_ldg_atom
-                                or _has_complex_cf or _has_scalar_ldg
+                                or _cf_fb or _has_scalar_ldg
                                 or _has_bar)
         if _needs_full_fallback and ptxas_meta:
             ptxas_cubin = ptxas_meta.get('cubin_bytes')
