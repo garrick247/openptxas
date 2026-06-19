@@ -452,6 +452,13 @@ def _get_src_regs(raw: bytes) -> set[int]:
     # are dispatched first so the generic set-based chain cannot
     # silently route them through a fallback that returns the wrong
     # source set.
+    if opcode == 0x810:
+        # IADD3.IMM R-imm: b3 = src0 GPR, b4..b7 = 32-bit imm, b8 = src2 GPR.
+        # b4 is the immediate low byte, NOT a register -- reading it produces
+        # a phantom source (imm & 0xff) and false RAW deps.
+        if raw[3] < 255: regs.add(raw[3])
+        if raw[8] < 255: regs.add(raw[8])
+        return regs
     if opcode == 0x812:
         # LOP3.IMM / IADD3 R-imm: b3 = src0 GPR, b4..b7 = 32-bit imm, b8 = src2 GPR.
         if raw[3] < 255: regs.add(raw[3])
@@ -554,7 +561,7 @@ def _get_src_regs(raw: bytes) -> set[int]:
                        0x245, 0x305, 0x306, 0x311, 0x312):
             # MUFU/POPC/BREV/FLO/IABS/I2FP/F2I (both F32/F64): single src at b4 only
             if raw[4] < 255: regs.add(raw[4])
-        elif opcode in (0x210, 0x212, 0x810):  # IADD3/LOP3/IADD3.IMM: src0=b3, src1=b4, src2=b8
+        elif opcode in (0x210, 0x212):  # IADD3/LOP3 R-R-R: src0=b3, src1=b4, src2=b8 (0x810 IADD3.IMM handled above)
             if raw[3] < 255: regs.add(raw[3])
             if raw[4] < 255: regs.add(raw[4])
             if raw[8] < 255: regs.add(raw[8])
