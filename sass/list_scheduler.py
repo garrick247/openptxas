@@ -132,6 +132,21 @@ def schedule_and_rename(instrs, body_start, L=_L_DEFAULT):
     # if it is READ somewhere after the run's end before being redefined.
     out = list(instrs)
     runs = list(_runs(out, body_start))
+    # CFG-aware precise liveness (opt-in OPENPTXAS_CFG_LIVENESS): the true set of
+    # registers live across each run (cfg.live_after_index, incl. back-edges)
+    # replaces the conservative used-anywhere-outside-run set. Precomputed on the
+    # ORIGINAL stream -- renaming preserves the live-register SETS, so the sets stay
+    # valid across splicing.
+    _cfg_live = {}
+    if os.environ.get('OPENPTXAS_CFG_LIVENESS') and runs:
+        try:
+            from sass.cfg import build_cfg, compute_liveness, live_after_index
+            _cfg = build_cfg(out)
+            _li, _lo = compute_liveness(out, _cfg)
+            for (_s, _e) in runs:
+                _cfg_live[(_s, _e)] = live_after_index(out, _cfg, _lo, _e - 1)
+        except Exception:
+            _cfg_live = {}
     # process runs back-to-front so index ranges stay valid as we splice
     for (s, e) in reversed(runs):
         # HAZARD-GATE: only reschedule runs that actually contain the FXU->FXU
@@ -140,22 +155,28 @@ def schedule_and_rename(instrs, body_start, L=_L_DEFAULT):
         # the pass never bloats non-racing kernels.
         if not _has_fxu_hazard(out[s:e], L):
             continue
-        liveout = _liveout_after(out, e)
-        # regs touched anywhere OUTSIDE this run: CFG-sound superset of
-        # everything live across the run on any path (incl. back-edges).
-        reserved = set()
-        for _k in range(len(out)):
-            if s <= _k < e:
-                continue
-            _r = out[_k].raw
-            if _get_opcode(_r) == _NOP:
-                continue
-            for _x in _get_src_regs(_r):
-                if _x < 255:
-                    reserved.add(_x)
-            for _x in _get_dest_regs(_r):
-                if _x < 255:
-                    reserved.add(_x)
+        if (s, e) in _cfg_live:
+            # CFG-precise: regs live across the run gate BOTH the rename pool
+            # (don't clobber a live reg) and visout (don't rename a live value).
+            reserved = _cfg_live[(s, e)]
+            liveout = _cfg_live[(s, e)]
+        else:
+            liveout = _liveout_after(out, e)
+            # regs touched anywhere OUTSIDE this run: CFG-sound superset of
+            # everything live across the run on any path (incl. back-edges).
+            reserved = set()
+            for _k in range(len(out)):
+                if s <= _k < e:
+                    continue
+                _r = out[_k].raw
+                if _get_opcode(_r) == _NOP:
+                    continue
+                for _x in _get_src_regs(_r):
+                    if _x < 255:
+                        reserved.add(_x)
+                for _x in _get_dest_regs(_r):
+                    if _x < 255:
+                        reserved.add(_x)
         new = _sched_rename_run(out[s:e], liveout, L, reserved)
         out[s:e] = new
     return out
