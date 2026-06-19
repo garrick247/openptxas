@@ -2382,11 +2382,15 @@ def compile_function(fn: Function, verbose: bool = False,
                 continue
             # Extract target label from comment — match "BRA <label>" specifically
             # to avoid matching label tags at the start of the comment
+            # Extract the EXACT branch-target token from the comment.
+            # A substring scan (`f'BRA {tl}' in comment`) mis-matches a
+            # shorter label that is a prefix of the real target, e.g.
+            # '.L_x_5' inside 'BRA .L_x_50' -> garbage offset / illegal instr.
             target_label = None
-            for _, tl in ctx._bra_fixups:
-                if f'BRA {tl}' in si.comment:
-                    target_label = tl
-                    break
+            if 'BRA ' in si.comment:
+                _tok = si.comment.split('BRA ', 1)[1].split()[0].strip()
+                if _tok in {tl for _, tl in ctx._bra_fixups}:
+                    target_label = _tok
             if target_label is None:
                 continue
 
