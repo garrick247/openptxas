@@ -7759,6 +7759,24 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                             continue  # UR-write instrs must be unconditional
                         new_raw = patch_pred(old.raw, pred=pd, neg=neg)
                         output[si_idx] = SassInstr(new_raw, pred_str + old.comment)
+                    # Bug#2: predicated 64-bit add/sub carry-out predicate is
+                    # fixed (P0 add / P1 sub); if it == the guard pd, the LO
+                    # clobbers its own guard.  Flip the carry to the other of
+                    # {P0,P1} (LO carry-out b10 and IADD3.X carry-in b10).
+                    if pd in (0, 1):
+                        _other = 1 - pd
+                        for _bi in range(_pre_len, len(output)):
+                            _r = bytearray(output[_bi].raw)
+                            if ((_r[0] | (_r[1] << 8)) & 0xFFF) != 0x210:
+                                continue
+                            if _r[9] == 0xe0 and ((_r[10] >> 1) & 7) == pd:
+                                _r[10] = 0xF0 | (_other << 1) | 1
+                                output[_bi] = SassInstr(bytes(_r),
+                                    output[_bi].comment + f'  [bug2 carry P{pd}->P{_other}]')
+                            elif _r[9] == 0xe4 and (1 if (_r[10] & 0x80) else 0) == pd:
+                                _r[10] = (_r[10] & 0x7f) | (0x80 if _other == 1 else 0)
+                                output[_bi] = SassInstr(bytes(_r),
+                                    output[_bi].comment + f'  [bug2 carry-in P{pd}->P{_other}]')
 
         # Tag the first instruction of this block with label marker for BRA fixup.
         # The scheduler may reorder instructions, so the pipeline needs to find
