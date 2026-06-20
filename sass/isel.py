@@ -6233,7 +6233,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                         emit_pd = pd
                                         _w_lbl = 'U64' if is_u64 else 'U32'
                                         output.append(SassInstr(
-                                            encode_isetp(emit_pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp),
+                                            encode_isetp(emit_pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp, width=(64 if is_u64 else 32)),
                                             f'ISETP.{cmp_name.upper()}.{_w_lbl}.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // vote-safe GPR'))
                                     else:
                                         emit_pd = pd
@@ -6251,7 +6251,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     br = ctx.ra.r32(b.name)
                                     emit_pd = pd
                                     output.append(SassInstr(
-                                        encode_isetp(emit_pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp),
+                                        encode_isetp(emit_pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp, width=(64 if is_u64 else 32)),
                                         f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // GPR path (no body LDCU.32)'))
                                 else:
                                     # No UR/param available for ISETP.UR. Use ISETP R-R
@@ -6262,7 +6262,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                     br = ctx.ra.r32(b.name)
                                     emit_pd = pd
                                     output.append(SassInstr(
-                                        encode_isetp(emit_pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp),
+                                        encode_isetp(emit_pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp, width=(64 if is_u64 else 32)),
                                         f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT'))
                             elif isinstance(b, ImmOp):
                                 # Immediate src1: ptxas uses ISETP R-R (0x20c) with RZ for imm=0,
@@ -6286,7 +6286,7 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                                 br = _materialize_imm(b, ctx, ctx.ra, output)
                                 emit_pd = pd
                                 output.append(SassInstr(
-                                    encode_isetp(emit_pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp),
+                                    encode_isetp(emit_pd, ar, br, cmp=isetp_cmp, signed=_is_signed_setp, width=(64 if is_u64 else 32)),
                                     f'ISETP.{cmp_name.upper()}.U32.AND P{emit_pd}, PT, R{ar}, R{br}, PT  // setp non-reg src1'))
                     else:
                         # Non-register pred dest or src0 — invalid PTX or unusual operand form
