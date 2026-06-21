@@ -44,6 +44,16 @@ _LAYOUT = {
     0x235: (2, (3, 4)),      # IADD R-R
     0x835: (2, (3,)),        # IADD R-imm
 }
+# Non-_LAYOUT reader ops whose GPR SOURCE bytes can be safely rewritten (source-only
+# re-encode) when a value they read is renamed. ONLY 32-bit single-reg sources (no
+# 64-bit register pairs) -- pair readers (ISETP.U64, IMAD.WIDE 0x225/0x825, IADD.64 0xc35)
+# are excluded (renaming a pair member needs consecutive allocation). opcode -> src bytes.
+_SRC_REENC = {
+    0x202: (4,),         # MOV Rd, Rs            (src b4)
+    0x305: (4,),         # F2I.*.U32 Rd, Rs      (src b4)
+    0x224: (3, 4, 8),    # IMAD.32 R-R-R         (32-bit, no pair)
+    0x2a4: (3, 4, 8),    # IMAD R-R-R (validated)
+}
 # Fences: never inside a run / never reorder across.
 _FENCE = (
     {0x981, 0xf60, 0xf63, 0xf66, 0xf6f, 0xf99}           # LDG/TEX family
@@ -132,13 +142,13 @@ def schedule_and_rename(instrs, body_start, L=_L_DEFAULT):
     # if it is READ somewhere after the run's end before being redefined.
     out = list(instrs)
     runs = list(_runs(out, body_start))
-    # CFG-aware precise liveness (opt-in OPENPTXAS_CFG_LIVENESS): the true set of
+    # CFG-aware precise liveness (DEFAULT; OPENPTXAS_NO_CFG_LIVENESS=1 disables): true set of
     # registers live across each run (cfg.live_after_index, incl. back-edges)
     # replaces the conservative used-anywhere-outside-run set. Precomputed on the
     # ORIGINAL stream -- renaming preserves the live-register SETS, so the sets stay
     # valid across splicing.
     _cfg_live = {}
-    if os.environ.get('OPENPTXAS_CFG_LIVENESS') and runs:
+    if runs and not os.environ.get('OPENPTXAS_NO_CFG_LIVENESS'):
         try:
             from sass.cfg import build_cfg, compute_liveness, live_after_index
             _cfg = build_cfg(out)
@@ -155,28 +165,32 @@ def schedule_and_rename(instrs, body_start, L=_L_DEFAULT):
         # the pass never bloats non-racing kernels.
         if not _has_fxu_hazard(out[s:e], L):
             continue
+        # reserved (rename-target pool exclusion): ALWAYS the conservative
+        # superset of every GPR touched outside this run. Over-reserving is
+        # always SOUND (never clobber a live reg); under-reserving (e.g. via
+        # precise liveness) risks clobbering a cross-block-live reg -> garbage.
+        reserved = set()
+        for _k in range(len(out)):
+            if s <= _k < e:
+                continue
+            _r = out[_k].raw
+            if _get_opcode(_r) == _NOP:
+                continue
+            for _x in _get_src_regs(_r):
+                if _x < 255:
+                    reserved.add(_x)
+            for _x in _get_dest_regs(_r):
+                if _x < 255:
+                    reserved.add(_x)
+        # liveout (rename GATE -- a live-out value must NOT be renamed): use
+        # CFG-precise liveness (incl. back-edges) when available so loop-carried /
+        # cross-block values are protected. The forward-only _liveout_after misses
+        # back-edge liveness and renames loop-carried values -> clobbers them
+        # (accum out1/out3 -> 0). reserved (above) is a superset of this.
         if (s, e) in _cfg_live:
-            # CFG-precise: regs live across the run gate BOTH the rename pool
-            # (don't clobber a live reg) and visout (don't rename a live value).
-            reserved = _cfg_live[(s, e)]
             liveout = _cfg_live[(s, e)]
         else:
             liveout = _liveout_after(out, e)
-            # regs touched anywhere OUTSIDE this run: CFG-sound superset of
-            # everything live across the run on any path (incl. back-edges).
-            reserved = set()
-            for _k in range(len(out)):
-                if s <= _k < e:
-                    continue
-                _r = out[_k].raw
-                if _get_opcode(_r) == _NOP:
-                    continue
-                for _x in _get_src_regs(_r):
-                    if _x < 255:
-                        reserved.add(_x)
-                for _x in _get_dest_regs(_r):
-                    if _x < 255:
-                        reserved.add(_x)
         new = _sched_rename_run(out[s:e], liveout, L, reserved)
         out[s:e] = new
     return out
@@ -275,7 +289,7 @@ def _sched_rename_run(run, liveout, L, reserved=frozenset()):
             p = vprod[v]
             if (p is not None and op[p] in _LAYOUT and len(gwr[p]) == 1
                     and not visout[v]
-                    and all(op[r] in _LAYOUT for r in readers[v])):
+                    and all(op[r] in _LAYOUT or op[r] in _SRC_REENC for r in readers[v])):
                 vphys_pin[v] = None             # renamable
 
     # ---- dependency DAG ----
@@ -429,6 +443,14 @@ def _sched_rename_run(run, liveout, L, reserved=frozenset()):
                 srcphys.append(phys[srcmap[rg]] if rg in srcmap else rg)
             outsi.append(SassInstr(reencode(raws[i], phys[idst[i][1]], srcphys),
                                    real[i].comment))
+        elif op[i] in _SRC_REENC:
+            _b = bytearray(raws[i]); _smap = {r: v for (r, v) in isrc[i]}
+            for _bb in _SRC_REENC[op[i]]:
+                _rg = raws[i][_bb]
+                if _rg != 255 and _rg in _smap:
+                    _np = phys[_smap[_rg]]; _b[_bb] = _np
+                    maxreg[0] = max(maxreg[0], _np)
+            outsi.append(SassInstr(bytes(_b), real[i].comment))
         else:
             outsi.append(real[i])
         # free dead source values -> cooldown (reusable L positions later)
