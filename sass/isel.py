@@ -6733,6 +6733,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                         output.append(SassInstr(
                             encode_imad_wide_rr(d_lo, a, b, c_lo),
                             f'IMAD.WIDE R{d_lo}, R{a}, R{b}, R{c_lo}  // mad.wide.{typ} R-R'))
+                    if hasattr(ctx, '_gpr_written'):
+                        ctx._gpr_written.add(instr.dest.name)  # addr-reg for later ld/st
 
                 elif op == 'mul' and 'hi' in instr.types and typ in ('u32', 's32'):
                     # mul.hi.u32: upper 32 bits of 32×32 product.
